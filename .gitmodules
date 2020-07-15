@@ -1,0 +1,3 @@
+[submodule "SCAN"]
+	path = SCAN
+	url = git@github.com:brendenlake/SCAN.git
