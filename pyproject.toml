@@ -8,6 +8,11 @@ authors = ["Aidan Swope <aidanswope@gmail.com>"]
 python = "^3.8"
 parsy = "^1.3.0"
 graphviz = "^0.14.1"
+torchtext = "^0.6.0"
+revtok = "^0.0.3"
+tensorboard = "^2.2.2"
+pytorch-lightning = "^0.8.5"
+torch = {url = "https://download.pytorch.org/whl/cu101/torch-1.5.1%2Bcu101-cp38-cp38-linux_x86_64.whl", platform = "linux"}
 
 [tool.poetry.dev-dependencies]
 python-language-server = {version = "^0.34.1", allow-prereleases = true}
