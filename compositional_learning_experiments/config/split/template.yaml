@@ -1,0 +1,7 @@
+# Train on all of the tasks excluding a "template" (a complex subcommand), then test on
+# compositions involving that template.
+# Valid templates are: right, opposite_right, around_right, jump_around_right
+split:
+  template: jump_around_right
+  train: SCAN/template_split/tasks_train_template_${split.template}.txt
+  val: SCAN/template_split/tasks_test_template_${split.template}.txt

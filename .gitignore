@@ -1,6 +1,6 @@
 ### Project files
 SCAN/
-lightning_logs/
+outputs/
 
 ### Vim
 ### From: https://github.com/github/gitignore/blob/master/Global/Vim.gitignore

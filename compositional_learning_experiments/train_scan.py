@@ -2,10 +2,13 @@
 Code to run experiments using the SCAN dataset.
 """
 
-import argparse
+import os
+import logging
 import math
 from typing import List, Optional, Tuple
 
+import hydra
+import omegaconf
 import pytorch_lightning as pl
 import torch
 import torch.nn
@@ -17,11 +20,6 @@ from compositional_learning_experiments import parse_scan
 # Derived from the SCAN grammar; see Figure 6/7 of https://arxiv.org/pdf/1711.00350.pdf.
 MAX_INPUT_LENGTH = 9
 MAX_OUTPUT_LENGTH = 50  # NOTE: includes <eos> and <init> tokens
-
-# TODO: benchmark variants:
-#   - No fixed length
-#   - Fixed length original (9 / 50)
-#   - Fixed length powers of 2 (16 / 64)
 
 
 def tokenize(string: str) -> List[str]:
@@ -239,32 +237,15 @@ class SCANTransformer(pl.LightningModule):
             dropout=dropout,
         )
 
-    def add_hparams_argparse(self, parser: argparse.ArgumentParser) -> None:
-        """
-        Modifies an argparse parser in place to add this model's hyperparameters
-        as arguments.
-
-        Parameters
-        ----------
-        parser : argparse.ArgumentParser
-            The parser to add arguments to.
-        """
-        parser.add_argument("--val_dataset", type=str, required=True)
-        parser.add_argument("--train_dataset", type=str, required=True)
-        parser.add_argument("--learning_rate", type=float, required=True)
-        parser.add_argument("--d_model", type=int, required=True)
-        parser.add_argument("--nhead", type=int, required=True)
-        parser.add_argument("--num_encoder_layers", type=int, required=True)
-        parser.add_argument("--num_decoder_layers", type=int, required=True)
-        parser.add_argument("--dropout", type=float, required=True)
-
     def forward(self, src, tgt):
         input_pad_mask = src.T == self.input_pad_i
         target_pad_mask = tgt.T == self.target_pad_i
-        future_mask = self.transformer.generate_square_subsequent_mask(tgt.size(0))
 
         input_enc = self.positional_encoding(self.input_embedding(src) * self.scale)
         target_enc = self.positional_encoding(self.target_embedding(tgt) * self.scale)
+        future_mask = self.transformer.generate_square_subsequent_mask(
+            tgt.size(0)
+        ).type_as(input_enc)
 
         predicted_embeddings = self.transformer(
             input_enc,
@@ -401,14 +382,14 @@ class SCANTransformer(pl.LightningModule):
         )
 
         return {
-            "loss": loss,
-            "token_accuracy": token_accuracy,
-            "sequence_accuracy": sequence_accuracy,
+            "loss": loss.cpu(),
+            "token_accuracy": token_accuracy.cpu(),
+            "sequence_accuracy": sequence_accuracy.cpu(),
         }
 
     def validation_epoch_end(self, outputs):
         aggregated = pl.loggers.base.merge_dicts(outputs)
-        val_metrics = {f"val/{k}": v for (k, v) in aggregated.items()}
+        val_metrics = {f"val/{k}": torch.tensor(v) for (k, v) in aggregated.items()}
 
         for command in TEST_COMMANDS:
             output = self.infer_greedy(command)
@@ -455,20 +436,29 @@ class SCANTransformer(pl.LightningModule):
         )
 
         # Certain submodules are based on the dataset vocab and must be defined here
-        self.input_embedding = torch.nn.Embedding(
-            num_embeddings=len(self.input_field.vocab),
-            embedding_dim=self.hparams.d_model,
-            padding_idx=self.input_pad_i,
+        self.add_module(
+            "input_embedding",
+            torch.nn.Embedding(
+                num_embeddings=len(self.input_field.vocab),
+                embedding_dim=self.hparams.d_model,
+                padding_idx=self.input_pad_i,
+            ),
         )
-        self.target_embedding = torch.nn.Embedding(
-            num_embeddings=len(self.target_field.vocab),
-            embedding_dim=self.hparams.d_model,
-            padding_idx=self.target_pad_i,
+        self.add_module(
+            "target_embedding",
+            torch.nn.Embedding(
+                num_embeddings=len(self.target_field.vocab),
+                embedding_dim=self.hparams.d_model,
+                padding_idx=self.target_pad_i,
+            ),
         )
-        self.output = torch.nn.Linear(
-            self.hparams.d_model, len(self.target_field.vocab)
+        self.add_module(
+            "output",
+            torch.nn.Linear(self.hparams.d_model, len(self.target_field.vocab)),
         )
-        self.loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.target_pad_i)
+        self.add_module(
+            "loss_fn", torch.nn.CrossEntropyLoss(ignore_index=self.target_pad_i)
+        )
 
     def train_dataloader(self):
         return self.train_iter
@@ -477,18 +467,30 @@ class SCANTransformer(pl.LightningModule):
         return self.val_iter
 
 
-# TODO: abstract into a run script
-model = SCANTransformer(
-    train_dataset="fake_training.txt",
-    val_dataset="fake_validation.txt",
-    batch_size=2,
-    learning_rate=1e-5,
-    d_model=128,
-    nhead=2,
-    num_encoder_layers=2,
-    num_decoder_layers=2,
-    dropout=0.0,
-)
+logger = logging.getLogger(__name__)
 
-trainer = pl.Trainer(max_epochs=50)
-trainer.fit(model)
+
+@hydra.main(config_path="config/config.yaml", strict=False)
+def main(cfg: omegaconf.DictConfig):
+    # TODO: handle multiple model types
+    model = SCANTransformer(
+        train_dataset=hydra.utils.to_absolute_path(cfg.split.train),
+        val_dataset=hydra.utils.to_absolute_path(cfg.split.val),
+        batch_size=cfg.training.batch_size,
+        learning_rate=cfg.training.learning_rate,
+        d_model=cfg.model.d_model,
+        nhead=cfg.model.nhead,
+        num_encoder_layers=cfg.model.num_encoder_layers,
+        num_decoder_layers=cfg.model.num_decoder_layers,
+        dropout=cfg.model.dropout,
+    )
+    trainer = pl.Trainer(
+        logger=pl.loggers.TensorBoardLogger(os.getcwd(), name="", version=""),
+        checkpoint_callback=pl.callbacks.ModelCheckpoint(monitor="val/loss"),
+        **cfg.trainer,
+    )
+    trainer.fit(model)
+
+
+if __name__ == "__main__":
+    main()

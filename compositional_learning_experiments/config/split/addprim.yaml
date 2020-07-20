@@ -1,0 +1,8 @@
+# Train on all of the tasks excluding a primitive, plus just that primitive alone
+# (oversampled to be 10% of the dataset). Test on compositions involving that primitive.
+# Valid primitives are: jump, turn_left
+# NOTE: variants with additional examples are available but not configured.
+split:
+  primitive: jump
+  train: SCAN/add_prim_split/tasks_train_addprim_${split.primitive}.txt
+  val: SCAN/add_prim_split/tasks_test_addprim_${split.primitive}.txt

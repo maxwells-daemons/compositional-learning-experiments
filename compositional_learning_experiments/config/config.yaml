@@ -1,0 +1,7 @@
+defaults:
+  - model: transformer
+  - split: simple
+
+trainer:
+  gpus: 1
+  max_epochs: 100

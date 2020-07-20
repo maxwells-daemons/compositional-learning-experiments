@@ -1,0 +1,11 @@
+model:
+  name: transformer
+  d_model: 128
+  nhead: 16
+  num_encoder_layers: 2
+  num_decoder_layers: 2
+  dropout: 0.1
+
+training:
+  batch_size: 128
+  learning_rate: 5.0e-4

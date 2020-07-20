@@ -1,0 +1,7 @@
+# Train with 0, 1, 2, or 3 variants of the subcommand "<primitive> around right", then
+# test on the subcommand "jump around right" (never seen in training).
+# Valid fillers are: 0, 1, 2, 3
+split:
+  fillers: 3
+  train: SCAN/template_split/tasks_train_filler_num${split.fillers}.txt
+  val: SCAN/template_split/tasks_test_filler_num${split.fillers}.txt

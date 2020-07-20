@@ -1,0 +1,5 @@
+# Use the ~80% shortest sequences (by output length) for training, and the remainder
+# for testing.
+split:
+  train: SCAN/length_split/tasks_train_length.txt
+  val: SCAN/length_split/tasks_test_length.txt
