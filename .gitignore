@@ -1,3 +1,7 @@
+### Project files
+SCAN/
+lightning_logs/
+
 ### Vim
 ### From: https://github.com/github/gitignore/blob/master/Global/Vim.gitignore
 # Swap
