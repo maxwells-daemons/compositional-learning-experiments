@@ -237,6 +237,47 @@ class SCANTransformer(pl.LightningModule):
             dropout=dropout,
         )
 
+        train_dataset = scan_dataset(self.hparams.train_dataset)
+        val_dataset = scan_dataset(self.hparams.val_dataset)
+
+        self.input_field = FIELDS["input"]
+        self.target_field = FIELDS["target"]
+        self.input_field.build_vocab(train_dataset, val_dataset)
+        self.target_field.build_vocab(train_dataset, val_dataset)
+
+        self.input_pad_i = self.input_field.vocab.stoi[self.input_field.pad_token]
+        self.target_pad_i = self.target_field.vocab.stoi[self.target_field.pad_token]
+        self.target_init_i = self.target_field.vocab.stoi[self.target_field.init_token]
+        self.target_eos_i = self.target_field.vocab.stoi[self.target_field.eos_token]
+
+        self.train_iter = torchtext.data.Iterator(
+            train_dataset, self.hparams.batch_size, device=self.device, train=True
+        )
+        self.val_iter = torchtext.data.Iterator(
+            val_dataset,
+            self.hparams.batch_size,
+            device=self.device,
+            train=False,
+            sort=False,
+        )
+
+        # Certain submodules are based on the dataset vocab and must be defined here
+        self.input_embedding = torch.nn.Embedding(
+            num_embeddings=len(self.input_field.vocab),
+            embedding_dim=self.hparams.d_model,
+            padding_idx=self.input_pad_i,
+        )
+        self.target_embedding = torch.nn.Embedding(
+            num_embeddings=len(self.target_field.vocab),
+            embedding_dim=self.hparams.d_model,
+            padding_idx=self.target_pad_i,
+        )
+
+        self.output = torch.nn.Linear(
+            self.hparams.d_model, len(self.target_field.vocab)
+        )
+        self.loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.target_pad_i)
+
     def forward(self, src, tgt):
         input_pad_mask = src.T == self.input_pad_i
         target_pad_mask = tgt.T == self.target_pad_i
@@ -253,6 +294,7 @@ class SCANTransformer(pl.LightningModule):
             tgt_mask=future_mask,
             src_key_padding_mask=input_pad_mask,
             tgt_key_padding_mask=target_pad_mask,
+            memory_key_padding_mask=input_pad_mask,
         )
         predicted_logits = self.output(predicted_embeddings)
         return predicted_logits
@@ -260,6 +302,7 @@ class SCANTransformer(pl.LightningModule):
     def infer_greedy(self, src: str) -> str:
         """
         Infer an output sequence from an input string using greedy decoding.
+        NOTE: does not handle <pad> tokens in the input!
 
         Parameters
         ----------
@@ -288,10 +331,15 @@ class SCANTransformer(pl.LightningModule):
                 generated_tokens[-1] != self.target_eos_i
                 and generated_tokens.numel() < MAX_OUTPUT_LENGTH
             ):
+                future_mask = self.transformer.generate_square_subsequent_mask(
+                    generated_tokens.numel()
+                ).type_as(input_enc)
                 target_enc = self.positional_encoding(
                     self.target_embedding(generated_tokens.unsqueeze(1)) * self.scale
                 )
-                predicted_embeddings = self.transformer.decoder(target_enc, memory)
+                predicted_embeddings = self.transformer.decoder(
+                    target_enc, memory, tgt_mask=future_mask
+                )
                 predicted_logits = self.output(predicted_embeddings)
                 new_token = predicted_logits[-1, 0, :].argmax()
                 generated_tokens = torch.cat([generated_tokens, new_token.unsqueeze(0)])
@@ -399,6 +447,7 @@ class SCANTransformer(pl.LightningModule):
 
     # Data config
     def setup(self, stage):
+        # Adding dummy values now makes live values show in the "metrics" UI later
         self.logger.log_hyperparams(
             self.hparams,
             {
@@ -409,55 +458,6 @@ class SCANTransformer(pl.LightningModule):
                 "val/token_accuracy": 0.0,
                 "val/sequence_accuracy": 0.0,
             },
-        )
-
-        train_dataset = scan_dataset(self.hparams.train_dataset)
-        val_dataset = scan_dataset(self.hparams.val_dataset)
-
-        self.input_field = FIELDS["input"]
-        self.target_field = FIELDS["target"]
-        self.input_field.build_vocab(train_dataset, val_dataset)
-        self.target_field.build_vocab(train_dataset, val_dataset)
-
-        self.input_pad_i = self.input_field.vocab.stoi[self.input_field.pad_token]
-        self.target_pad_i = self.target_field.vocab.stoi[self.target_field.pad_token]
-        self.target_init_i = self.target_field.vocab.stoi[self.target_field.init_token]
-        self.target_eos_i = self.target_field.vocab.stoi[self.target_field.eos_token]
-
-        self.train_iter = torchtext.data.Iterator(
-            train_dataset, self.hparams.batch_size, device=self.device, train=True
-        )
-        self.val_iter = torchtext.data.Iterator(
-            val_dataset,
-            self.hparams.batch_size,
-            device=self.device,
-            train=False,
-            sort=False,
-        )
-
-        # Certain submodules are based on the dataset vocab and must be defined here
-        self.add_module(
-            "input_embedding",
-            torch.nn.Embedding(
-                num_embeddings=len(self.input_field.vocab),
-                embedding_dim=self.hparams.d_model,
-                padding_idx=self.input_pad_i,
-            ),
-        )
-        self.add_module(
-            "target_embedding",
-            torch.nn.Embedding(
-                num_embeddings=len(self.target_field.vocab),
-                embedding_dim=self.hparams.d_model,
-                padding_idx=self.target_pad_i,
-            ),
-        )
-        self.add_module(
-            "output",
-            torch.nn.Linear(self.hparams.d_model, len(self.target_field.vocab)),
-        )
-        self.add_module(
-            "loss_fn", torch.nn.CrossEntropyLoss(ignore_index=self.target_pad_i)
         )
 
     def train_dataloader(self):
