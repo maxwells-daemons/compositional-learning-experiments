@@ -2,6 +2,7 @@
 Code to run experiments using the SCAN dataset.
 """
 
+import abc
 import os
 import logging
 import math
@@ -166,10 +167,12 @@ class PositionalEncoding(torch.nn.Module):
         return self.dropout(x)
 
 
-class SCANTransformer(pl.LightningModule):
+class SCANBase(pl.LightningModule, abc.ABC):
     """
-    A typical sequence-to-sequence transformer for the SCAN task.
-    Model parameters and forward() are as they are in torch.nn.Transformer.
+    An abstract base class for models that will be trained on SCAN.
+
+    All sequences are assumed to use [SEQUENCE_LENGTH, BATCH_SIZE, DIM] convention.
+    This class handles data loading and training/validation conventions.
 
     Parameters
     ----------
@@ -179,8 +182,6 @@ class SCANTransformer(pl.LightningModule):
         A path to the dataset to validate on.
     batch_size : int
         Batch size to use for training and validation.
-    learning_rate : float
-        Learning rate to use.
 
     Attributes
     ----------
@@ -212,33 +213,12 @@ class SCANTransformer(pl.LightningModule):
     val_iter: torchtext.data.Iterator
 
     def __init__(
-        self,
-        train_dataset: str,
-        val_dataset: str,
-        batch_size: int,
-        learning_rate: float,
-        d_model: int,
-        nhead: int,
-        num_encoder_layers: int,
-        num_decoder_layers: int,
-        dropout: float,
+        self, train_dataset: str, val_dataset: str, batch_size: int,
     ):
         super().__init__()
-        self.save_hyperparameters()
 
-        self.scale = math.sqrt(d_model)
-        self.positional_encoding = PositionalEncoding(d_model, dropout)
-        self.transformer = torch.nn.Transformer(  # type: ignore
-            d_model=d_model,
-            nhead=nhead,
-            num_encoder_layers=num_encoder_layers,
-            num_decoder_layers=num_decoder_layers,
-            dim_feedforward=d_model * 4,
-            dropout=dropout,
-        )
-
-        train_dataset = scan_dataset(self.hparams.train_dataset)
-        val_dataset = scan_dataset(self.hparams.val_dataset)
+        train_dataset = scan_dataset(train_dataset)
+        val_dataset = scan_dataset(val_dataset)
 
         self.input_field = FIELDS["input"]
         self.target_field = FIELDS["target"]
@@ -251,54 +231,41 @@ class SCANTransformer(pl.LightningModule):
         self.target_eos_i = self.target_field.vocab.stoi[self.target_field.eos_token]
 
         self.train_iter = torchtext.data.Iterator(
-            train_dataset, self.hparams.batch_size, device=self.device, train=True
+            train_dataset, batch_size, device=self.device, train=True
         )
         self.val_iter = torchtext.data.Iterator(
-            val_dataset,
-            self.hparams.batch_size,
-            device=self.device,
-            train=False,
-            sort=False,
+            val_dataset, batch_size, device=self.device, train=False, sort=False,
         )
 
-        # Certain submodules are based on the dataset vocab and must be defined here
-        self.input_embedding = torch.nn.Embedding(
-            num_embeddings=len(self.input_field.vocab),
-            embedding_dim=self.hparams.d_model,
-            padding_idx=self.input_pad_i,
-        )
-        self.target_embedding = torch.nn.Embedding(
-            num_embeddings=len(self.target_field.vocab),
-            embedding_dim=self.hparams.d_model,
-            padding_idx=self.target_pad_i,
-        )
-
-        self.output = torch.nn.Linear(
-            self.hparams.d_model, len(self.target_field.vocab)
-        )
         self.loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.target_pad_i)
 
-    def forward(self, src, tgt):
-        input_pad_mask = src.T == self.input_pad_i
-        target_pad_mask = tgt.T == self.target_pad_i
+    @abc.abstractmethod
+    def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        """
+        Predict logits for an encoder-decoder teacher-forcing training setup.
 
-        input_enc = self.positional_encoding(self.input_embedding(src) * self.scale)
-        target_enc = self.positional_encoding(self.target_embedding(tgt) * self.scale)
-        future_mask = self.transformer.generate_square_subsequent_mask(
-            tgt.size(0)
-        ).type_as(input_enc)
+        The subclass must apply masking during decoding so that output tokens
+        cannot see themselves or future tokens.
 
-        predicted_embeddings = self.transformer(
-            input_enc,
-            target_enc,
-            tgt_mask=future_mask,
-            src_key_padding_mask=input_pad_mask,
-            tgt_key_padding_mask=target_pad_mask,
-            memory_key_padding_mask=input_pad_mask,
-        )
-        predicted_logits = self.output(predicted_embeddings)
-        return predicted_logits
+        Parameters
+        ----------
+        src : torch.Tensor
+            A batch of input sequences, given as word indices.
+            Shaped as [SEQUENCE_LENGTH, BATCH_SIZE].
+        tgt : torch.Tensor
+            A batch of target sequences, given as word indices and without the final
+            token (<eos> or <pad>). Shaped as [SEQUENCE_LENGTH, BATCH_SIZE].
 
+        Returns
+        -------
+        torch.Tensor
+            For each place in each sequence, a set of logits for the *next* token
+            in the sequence (i.e. beginning with the first word following <init> and
+            ideally ending with <eos>). Shaped as [SEQUENCE_LENGTH, BATCH_SIZE, DIM].
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def infer_greedy(self, src: str) -> str:
         """
         Infer an output sequence from an input string using greedy decoding.
@@ -314,37 +281,7 @@ class SCANTransformer(pl.LightningModule):
         str
             The predicted output in the SCAN output grammar.
         """
-        src_tokens = self.input_field.preprocess(src)
-        src_tensor = self.input_field.numericalize([src_tokens], device=self.device)
-
-        generated_tokens = torch.tensor(
-            self.target_init_i, device=self.device
-        ).unsqueeze(0)
-
-        with torch.no_grad():
-            input_enc = self.positional_encoding(
-                self.input_embedding(src_tensor) * self.scale
-            )
-            memory = self.transformer.encoder(input_enc)
-
-            while (
-                generated_tokens[-1] != self.target_eos_i
-                and generated_tokens.numel() < MAX_OUTPUT_LENGTH
-            ):
-                future_mask = self.transformer.generate_square_subsequent_mask(
-                    generated_tokens.numel()
-                ).type_as(input_enc)
-                target_enc = self.positional_encoding(
-                    self.target_embedding(generated_tokens.unsqueeze(1)) * self.scale
-                )
-                predicted_embeddings = self.transformer.decoder(
-                    target_enc, memory, tgt_mask=future_mask
-                )
-                predicted_logits = self.output(predicted_embeddings)
-                new_token = predicted_logits[-1, 0, :].argmax()
-                generated_tokens = torch.cat([generated_tokens, new_token.unsqueeze(0)])
-
-        return self.target_field.reverse(generated_tokens.unsqueeze(1))[0]
+        raise NotImplementedError
 
     def compute_batch_accuracy(
         self, predicted_tokens: torch.Tensor, target_tokens: torch.Tensor
@@ -383,15 +320,7 @@ class SCANTransformer(pl.LightningModule):
 
         return token_accuracy, sequence_accuracy
 
-    # Training config
-    def configure_optimizers(self):
-        return torch.optim.Adam(
-            self.parameters(),
-            lr=self.hparams.learning_rate,
-            betas=(0.9, 0.98),
-            eps=1e-9,
-        )
-
+    # Training
     def training_step(self, batch, batch_idx):
         tgt_input = batch.target[:-1]
         tgt_goal = batch.target[1:]
@@ -445,7 +374,7 @@ class SCANTransformer(pl.LightningModule):
 
         return {"log": val_metrics}
 
-    # Data config
+    # Data
     def setup(self, stage):
         # Adding dummy values now makes live values show in the "metrics" UI later
         self.logger.log_hyperparams(
@@ -468,6 +397,112 @@ class SCANTransformer(pl.LightningModule):
 
 
 logger = logging.getLogger(__name__)
+
+class Transformer(SCANBase):
+    """
+    A typical sequence-to-sequence transformer for the SCAN task.
+    Model parameters and forward() are as they are in torch.nn.Transformer.
+    """
+
+    def __init__(
+        self,
+        train_dataset: str,
+        val_dataset: str,
+        batch_size: int,
+        learning_rate: float,
+        d_model: int,
+        nhead: int,
+        num_encoder_layers: int,
+        num_decoder_layers: int,
+        dropout: float,
+    ):
+        super().__init__(train_dataset, val_dataset, batch_size)
+        self.save_hyperparameters()
+        self.hparams.model_name = "Transformer"
+
+        self.scale = math.sqrt(d_model)
+        self.positional_encoding = PositionalEncoding(d_model, dropout)
+        self.transformer = torch.nn.Transformer(  # type: ignore
+            d_model=d_model,
+            nhead=nhead,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+        )
+        self.input_embedding = torch.nn.Embedding(
+            num_embeddings=len(self.input_field.vocab),
+            embedding_dim=d_model,
+            padding_idx=self.input_pad_i,
+        )
+        self.target_embedding = torch.nn.Embedding(
+            num_embeddings=len(self.target_field.vocab),
+            embedding_dim=d_model,
+            padding_idx=self.target_pad_i,
+        )
+        self.output = torch.nn.Linear(d_model, len(self.target_field.vocab))
+
+    def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        input_pad_mask = src.T == self.input_pad_i
+        target_pad_mask = tgt.T == self.target_pad_i
+
+        input_enc = self.positional_encoding(self.input_embedding(src) * self.scale)
+        target_enc = self.positional_encoding(self.target_embedding(tgt) * self.scale)
+        future_mask = self.transformer.generate_square_subsequent_mask(
+            tgt.size(0)
+        ).type_as(input_enc)
+
+        predicted_embeddings = self.transformer(
+            input_enc,
+            target_enc,
+            tgt_mask=future_mask,
+            src_key_padding_mask=input_pad_mask,
+            tgt_key_padding_mask=target_pad_mask,
+            memory_key_padding_mask=input_pad_mask,
+        )
+        predicted_logits = self.output(predicted_embeddings)
+        return predicted_logits
+
+    def infer_greedy(self, src: str) -> str:
+        src_tokens = self.input_field.preprocess(src)
+        src_tensor = self.input_field.numericalize([src_tokens], device=self.device)
+
+        generated_tokens = torch.tensor(
+            self.target_init_i, device=self.device
+        ).unsqueeze(0)
+
+        with torch.no_grad():
+            input_enc = self.positional_encoding(
+                self.input_embedding(src_tensor) * self.scale
+            )
+            memory = self.transformer.encoder(input_enc)
+
+            while (
+                generated_tokens[-1] != self.target_eos_i
+                and generated_tokens.numel() < MAX_OUTPUT_LENGTH
+            ):
+                future_mask = self.transformer.generate_square_subsequent_mask(
+                    generated_tokens.numel()
+                ).type_as(input_enc)
+                target_enc = self.positional_encoding(
+                    self.target_embedding(generated_tokens.unsqueeze(1)) * self.scale
+                )
+                predicted_embeddings = self.transformer.decoder(
+                    target_enc, memory, tgt_mask=future_mask
+                )
+                predicted_logits = self.output(predicted_embeddings)
+                new_token = predicted_logits[-1, 0, :].argmax()
+                generated_tokens = torch.cat([generated_tokens, new_token.unsqueeze(0)])
+
+        return self.target_field.reverse(generated_tokens.unsqueeze(1))[0]
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(
+            self.parameters(),
+            lr=self.hparams.learning_rate,
+            betas=(0.9, 0.98),
+            eps=1e-9,
+        )
 
 
 @hydra.main(config_path="config/config.yaml", strict=False)
