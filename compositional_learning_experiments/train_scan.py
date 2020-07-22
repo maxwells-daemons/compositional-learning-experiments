@@ -4,7 +4,6 @@ Code to run experiments using the SCAN dataset.
 
 import abc
 import os
-import logging
 import math
 from typing import List, Optional, Tuple
 
@@ -396,7 +395,111 @@ class SCANBase(pl.LightningModule, abc.ABC):
         return self.val_iter
 
 
-logger = logging.getLogger(__name__)
+class EncoderDecoderRNN(SCANBase):
+    """
+    An encoder-decoder ("seq2seq") RNN without attention.
+
+    Parameters
+    ----------
+    rnn_base : torch.nn.RNNBase constructor
+        A constructor of a class conforming to the interface of torch.nn.RNN.
+    d_model : int
+        The dimension of embedding and recurrent layers in this model.
+    num_layers : int
+        The number of stacked recurrent layers in the input and output RNNs.
+    dropout : float
+        How much dropout to apply in the recurrent layers.
+    """
+
+    def __init__(
+        self,
+        train_dataset: str,
+        val_dataset: str,
+        batch_size: int,
+        learning_rate: float,
+        rnn_base,
+        d_model: int,
+        num_layers: int,
+        dropout: float,
+    ):
+        super().__init__(train_dataset, val_dataset, batch_size)
+        self.save_hyperparameters()
+        self.hparams.model_name = "EncoderDecoderRNN"
+
+        self.encoder = rnn_base(
+            input_size=d_model,
+            hidden_size=d_model,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        self.decoder = rnn_base(
+            input_size=d_model,
+            hidden_size=d_model,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        self.input_embedding = torch.nn.Embedding(
+            num_embeddings=len(self.input_field.vocab),
+            embedding_dim=d_model,
+            padding_idx=self.input_pad_i,
+        )
+        self.target_embedding = torch.nn.Embedding(
+            num_embeddings=len(self.target_field.vocab),
+            embedding_dim=d_model,
+            padding_idx=self.target_pad_i,
+        )
+        self.output = torch.nn.Linear(d_model, len(self.target_field.vocab))
+
+    def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        input_enc = self.input_embedding(src)
+        target_enc = self.target_embedding(tgt)
+        src_lengths = src.size(0) - (src == self.input_pad_i).sum(0)
+        tgt_lengths = tgt.size(0) - (tgt == self.target_pad_i).sum(0)
+        src_packed = torch.nn.utils.rnn.pack_padded_sequence(
+            input_enc, src_lengths, enforce_sorted=False
+        )
+        tgt_packed = torch.nn.utils.rnn.pack_padded_sequence(
+            target_enc, tgt_lengths, enforce_sorted=False
+        )
+
+        _, context = self.encoder(src_packed)
+        packed_output, _ = self.decoder(tgt_packed, context)
+        # NOTE: this makes a prediction for every point in the sequence, including
+        # padding values. These must be ignored later.
+        predicted_embeddings, _ = torch.nn.utils.rnn.pad_packed_sequence(
+            packed_output,
+            total_length=MAX_OUTPUT_LENGTH - 1,  # Does not predict <init> token
+        )
+        predicted_logits = self.output(predicted_embeddings)
+        return predicted_logits
+
+    def infer_greedy(self, src: str) -> str:
+        src_tokens = self.input_field.preprocess(src)
+        src_tensor = self.input_field.numericalize([src_tokens], device=self.device)
+
+        generated_tokens = torch.tensor(
+            self.target_init_i, device=self.device
+        ).unsqueeze(0)
+
+        with torch.no_grad():
+            input_enc = self.input_embedding(src_tensor)
+            _, context = self.encoder(input_enc)
+
+            # Manually unroll decoder with sequence/batch dimensions of 1
+            for _ in range(MAX_OUTPUT_LENGTH):
+                target_enc = self.target_embedding(generated_tokens[-1])
+                predicted_embeddings, context = self.decoder(
+                    target_enc.unsqueeze(0).unsqueeze(0), context
+                )
+                predicted_logits = self.output(predicted_embeddings)
+                new_token = predicted_logits[0, 0, :].argmax()
+                generated_tokens = torch.cat([generated_tokens, new_token.unsqueeze(0)])
+
+        return self.target_field.reverse(generated_tokens.unsqueeze(1))[0]
+
+    def configure_optimizers(self):
+        return torch.optim.RMSprop(self.parameters(), lr=self.hparams.learning_rate)
+
 
 class Transformer(SCANBase):
     """
@@ -507,18 +610,41 @@ class Transformer(SCANBase):
 
 @hydra.main(config_path="config/config.yaml", strict=False)
 def main(cfg: omegaconf.DictConfig):
-    # TODO: handle multiple model types
-    model = SCANTransformer(
-        train_dataset=hydra.utils.to_absolute_path(cfg.split.train),
-        val_dataset=hydra.utils.to_absolute_path(cfg.split.val),
-        batch_size=cfg.training.batch_size,
-        learning_rate=cfg.training.learning_rate,
-        d_model=cfg.model.d_model,
-        nhead=cfg.model.nhead,
-        num_encoder_layers=cfg.model.num_encoder_layers,
-        num_decoder_layers=cfg.model.num_decoder_layers,
-        dropout=cfg.model.dropout,
-    )
+    if cfg.model.name == "Transformer":
+        model = Transformer(
+            train_dataset=hydra.utils.to_absolute_path(cfg.split.train),
+            val_dataset=hydra.utils.to_absolute_path(cfg.split.val),
+            batch_size=cfg.training.batch_size,
+            learning_rate=cfg.training.learning_rate,
+            d_model=cfg.model.d_model,
+            nhead=cfg.model.nhead,
+            num_encoder_layers=cfg.model.num_encoder_layers,
+            num_decoder_layers=cfg.model.num_decoder_layers,
+            dropout=cfg.model.dropout,
+        )
+    elif cfg.model.name == "EncoderDecoderRNN":
+        if cfg.model.rnn_base == "rnn":
+            rnn_base = torch.nn.RNN  # type: ignore
+        elif cfg.model.rnn_base == "lstm":
+            rnn_base = torch.nn.LSTM  # type: ignore
+        elif cfg.model.rnn_base == "gru":
+            rnn_base = torch.nn.GRU  # type: ignore
+        else:
+            raise ValueError("Unrecognized RNN type")
+
+        model = EncoderDecoderRNN(
+            train_dataset=hydra.utils.to_absolute_path(cfg.split.train),
+            val_dataset=hydra.utils.to_absolute_path(cfg.split.val),
+            batch_size=cfg.training.batch_size,
+            learning_rate=cfg.training.learning_rate,
+            rnn_base=rnn_base,
+            d_model=cfg.model.d_model,
+            num_layers=cfg.model.num_layers,
+            dropout=cfg.model.dropout,
+        )
+    else:
+        raise ValueError("Unrecognized model type")
+
     trainer = pl.Trainer(
         logger=pl.loggers.TensorBoardLogger(os.getcwd(), name="", version=""),
         checkpoint_callback=pl.callbacks.ModelCheckpoint(monitor="val/loss"),
