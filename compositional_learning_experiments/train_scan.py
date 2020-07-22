@@ -438,21 +438,28 @@ class EncoderDecoderRNN(SCANBase):
             num_layers=num_layers,
             dropout=dropout,
         )
-        self.input_embedding = torch.nn.Embedding(
-            num_embeddings=len(self.input_field.vocab),
-            embedding_dim=d_model,
-            padding_idx=self.input_pad_i,
+        self.dropout = torch.nn.Dropout(p=dropout)
+        self.input_pipeline = torch.nn.Sequential(
+            torch.nn.Embedding(
+                num_embeddings=len(self.input_field.vocab),
+                embedding_dim=d_model,
+                padding_idx=self.input_pad_i,
+            ),
+            self.dropout,
         )
-        self.target_embedding = torch.nn.Embedding(
-            num_embeddings=len(self.target_field.vocab),
-            embedding_dim=d_model,
-            padding_idx=self.target_pad_i,
+        self.target_pipeline = torch.nn.Sequential(
+            torch.nn.Embedding(
+                num_embeddings=len(self.target_field.vocab),
+                embedding_dim=d_model,
+                padding_idx=self.target_pad_i,
+            ),
+            self.dropout,
         )
         self.output = torch.nn.Linear(d_model, len(self.target_field.vocab))
 
     def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
-        input_enc = self.input_embedding(src)
-        target_enc = self.target_embedding(tgt)
+        input_enc = self.input_pipeline(src)
+        target_enc = self.target_pipeline(tgt)
         src_lengths = src.size(0) - (src == self.input_pad_i).sum(0)
         tgt_lengths = tgt.size(0) - (tgt == self.target_pad_i).sum(0)
         src_packed = torch.nn.utils.rnn.pack_padded_sequence(
@@ -482,12 +489,12 @@ class EncoderDecoderRNN(SCANBase):
         ).unsqueeze(0)
 
         with torch.no_grad():
-            input_enc = self.input_embedding(src_tensor)
+            input_enc = self.input_pipeline(src_tensor)
             _, context = self.encoder(input_enc)
 
             # Manually unroll decoder with sequence/batch dimensions of 1
             for _ in range(MAX_OUTPUT_LENGTH):
-                target_enc = self.target_embedding(generated_tokens[-1])
+                target_enc = self.target_pipeline(generated_tokens[-1])
                 predicted_embeddings, context = self.decoder(
                     target_enc.unsqueeze(0).unsqueeze(0), context
                 )
