@@ -1,0 +1,15 @@
+model:
+  name: AttentionRNN
+  rnn_base: lstm
+  d_model: 256
+  num_layers: 2
+  dropout: 0.0
+  bidirectional_encoder: true
+  attention_dim: 256
+
+training:
+  batch_size: 4
+  learning_rate: 1.0e-3
+
+trainer:
+  gradient_clip_val: 5
