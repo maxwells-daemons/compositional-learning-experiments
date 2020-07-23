@@ -436,6 +436,10 @@ def stack_bidirectional_context(context: torch.Tensor) -> torch.Tensor:
         return context.reshape([num_layers, batch_size, 2 * d_model])
 
 
+def get_rnn_constructor(variant: str):
+    return {"rnn": torch.nn.RNN, "lstm": torch.nn.LSTM, "gru": torch.nn.GRU,}[variant]
+
+
 class EncoderDecoderRNN(SCANBase):
     """
     An encoder-decoder ("seq2seq") RNN without attention.
@@ -461,7 +465,7 @@ class EncoderDecoderRNN(SCANBase):
         val_dataset: str,
         batch_size: int,
         learning_rate: float,
-        rnn_base,
+        rnn_base: str,
         d_model: int,
         num_layers: int,
         dropout: float,
@@ -472,14 +476,15 @@ class EncoderDecoderRNN(SCANBase):
         self.hparams.model_name = "EncoderDecoderRNN"
 
         self.decoder_width = (2 * d_model) if bidirectional_encoder else d_model
-        self.encoder = rnn_base(
+        rnn_base_constructor = get_rnn_constructor(rnn_base)
+        self.encoder = rnn_base_constructor(
             input_size=d_model,
             hidden_size=d_model,
             num_layers=num_layers,
             dropout=dropout,
             bidirectional=bidirectional_encoder,
         )
-        self.decoder = rnn_base(
+        self.decoder = rnn_base_constructor(
             input_size=d_model,
             hidden_size=self.decoder_width,
             num_layers=num_layers,
@@ -703,7 +708,7 @@ class AttentionRNN(SCANBase):
         val_dataset: str,
         batch_size: int,
         learning_rate: float,
-        rnn_base,
+        rnn_base: str,
         d_model: int,
         num_layers: int,
         dropout: float,
@@ -716,14 +721,15 @@ class AttentionRNN(SCANBase):
 
         self.decoder_width = (2 * d_model) if bidirectional_encoder else d_model
         self.decoder_input_size = d_model + self.decoder_width
-        self.encoder = rnn_base(
+        rnn_base_constructor = get_rnn_constructor(rnn_base)
+        self.encoder = rnn_base_constructor(
             input_size=d_model,
             hidden_size=d_model,
             num_layers=num_layers,
             dropout=dropout,
             bidirectional=bidirectional_encoder,
         )
-        self.decoder = rnn_base(
+        self.decoder = rnn_base_constructor(
             input_size=self.decoder_input_size,
             hidden_size=self.decoder_width,
             num_layers=num_layers,
@@ -977,16 +983,6 @@ class Transformer(SCANBase):
 
 @hydra.main(config_path="config/config.yaml", strict=False)
 def main(cfg: omegaconf.DictConfig):
-    if "rnn_base" in cfg.model:
-        if cfg.model.rnn_base == "rnn":
-            rnn_base = torch.nn.RNN  # type: ignore
-        elif cfg.model.rnn_base == "lstm":
-            rnn_base = torch.nn.LSTM  # type: ignore
-        elif cfg.model.rnn_base == "gru":
-            rnn_base = torch.nn.GRU  # type: ignore
-        else:
-            raise ValueError("Unrecognized RNN type")
-
     if cfg.model.name == "Transformer":
         model = Transformer(
             train_dataset=hydra.utils.to_absolute_path(cfg.split.train),
@@ -1005,7 +1001,7 @@ def main(cfg: omegaconf.DictConfig):
             val_dataset=hydra.utils.to_absolute_path(cfg.split.val),
             batch_size=cfg.training.batch_size,
             learning_rate=cfg.training.learning_rate,
-            rnn_base=rnn_base,
+            rnn_base=cfg.model.rnn_base,
             d_model=cfg.model.d_model,
             num_layers=cfg.model.num_layers,
             dropout=cfg.model.dropout,
@@ -1017,7 +1013,7 @@ def main(cfg: omegaconf.DictConfig):
             val_dataset=hydra.utils.to_absolute_path(cfg.split.val),
             batch_size=cfg.training.batch_size,
             learning_rate=cfg.training.learning_rate,
-            rnn_base=rnn_base,
+            rnn_base=cfg.model.rnn_base,
             d_model=cfg.model.d_model,
             num_layers=cfg.model.num_layers,
             dropout=cfg.model.dropout,
