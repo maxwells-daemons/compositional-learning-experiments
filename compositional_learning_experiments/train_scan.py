@@ -409,6 +409,9 @@ class EncoderDecoderRNN(SCANBase):
         The number of stacked recurrent layers in the input and output RNNs.
     dropout : float
         How much dropout to apply in the recurrent layers.
+    bidirectional_encoder : bool
+        If true, the encoder is bidirectional and the decoder is twice as wide
+        (to ensure the hidden dimensions match).
     """
 
     def __init__(
@@ -421,16 +424,19 @@ class EncoderDecoderRNN(SCANBase):
         d_model: int,
         num_layers: int,
         dropout: float,
+        bidirectional_encoder: bool,
     ):
         super().__init__(train_dataset, val_dataset, batch_size)
         self.save_hyperparameters()
         self.hparams.model_name = "EncoderDecoderRNN"
 
+        self.decoder_width = (2 * d_model) if bidirectional_encoder else d_model
         self.encoder = rnn_base(
             input_size=d_model,
             hidden_size=d_model,
             num_layers=num_layers,
             dropout=dropout,
+            bidirectional=bidirectional_encoder,
         )
         self.decoder = rnn_base(
             input_size=d_model,
@@ -455,7 +461,43 @@ class EncoderDecoderRNN(SCANBase):
             ),
             self.dropout,
         )
-        self.output = torch.nn.Linear(d_model, len(self.target_field.vocab))
+        self.output = torch.nn.Linear(self.decoder_width, len(self.target_field.vocab))
+
+    # Concatenate forward & backward directions on the hidden dimension axis
+    def stack_bidirectional_context(self, context: torch.Tensor) -> torch.Tensor:
+        if not self.hparams.bidirectional_encoder:
+            return context
+
+        if isinstance(context, tuple):  # LSTM; see below for detailed view
+            hidden, cell = context
+            batch_size = hidden.size(1)
+            hidden = hidden.view(
+                [self.hparams.num_layers, 2, batch_size, self.hparams.d_model]
+            )
+            hidden = hidden.permute([0, 2, 1, 3])
+            hidden = hidden.reshape(
+                [self.hparams.num_layers, batch_size, self.decoder_width]
+            )
+            cell = cell.view(
+                [self.hparams.num_layers, 2, batch_size, self.hparams.d_model]
+            )
+            cell = cell.permute([0, 2, 1, 3])
+            cell = cell.reshape(
+                [self.hparams.num_layers, batch_size, self.decoder_width]
+            )
+            return (hidden, cell)
+        else:  # RNN & GRU
+            batch_size = context.size(1)
+            # [layers * directions, batch, dims] -> [layers, directions, batch, dims]
+            context = context.view(
+                [self.hparams.num_layers, 2, batch_size, self.hparams.d_model]
+            )
+            # [layers, directions, batch, dims] -> [layers, batch, directions, dims]
+            context = context.permute([0, 2, 1, 3])
+            # [layers, batch, directions, dims] -> [layers, batch, directions * dims]
+            return context.reshape(
+                [self.hparams.num_layers, batch_size, self.decoder_width]
+            )
 
     def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
         input_enc = self.input_pipeline(src)
@@ -470,6 +512,7 @@ class EncoderDecoderRNN(SCANBase):
         )
 
         _, context = self.encoder(src_packed)
+        context = self.stack_bidirectional_context(context)
         packed_output, _ = self.decoder(tgt_packed, context)
         # NOTE: this makes a prediction for every point in the sequence, including
         # padding values. These must be ignored later.
@@ -491,6 +534,7 @@ class EncoderDecoderRNN(SCANBase):
         with torch.no_grad():
             input_enc = self.input_pipeline(src_tensor)
             _, context = self.encoder(input_enc)
+            context = self.stack_bidirectional_context(context)
 
             # Manually unroll decoder with sequence/batch dimensions of 1
             for _ in range(MAX_OUTPUT_LENGTH):
@@ -648,6 +692,7 @@ def main(cfg: omegaconf.DictConfig):
             d_model=cfg.model.d_model,
             num_layers=cfg.model.num_layers,
             dropout=cfg.model.dropout,
+            bidirectional_encoder=cfg.model.bidirectional_encoder,
         )
     else:
         raise ValueError("Unrecognized model type")
