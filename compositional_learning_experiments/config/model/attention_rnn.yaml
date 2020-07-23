@@ -1,6 +1,6 @@
 model:
   name: AttentionRNN
-  rnn_base: lstm
+  rnn_base: gru
   d_model: 256
   num_layers: 2
   dropout: 0.0
@@ -8,8 +8,8 @@ model:
   attention_dim: 256
 
 training:
-  batch_size: 4
+  batch_size: 128
   learning_rate: 1.0e-3
 
 trainer:
-  gradient_clip_val: 5
+  gradient_clip_val: 1.0
