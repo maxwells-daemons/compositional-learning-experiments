@@ -661,7 +661,7 @@ def plot_attention(
     plt.Figure
         A figure displaying the attention map.
     """
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(8, 4.8))
     heatmap = ax.pcolor(attention_map.T, cmap="viridis")
 
     # put the major ticks at the middle of each cell
@@ -674,6 +674,7 @@ def plot_attention(
     ax.invert_yaxis()
 
     plt.colorbar(heatmap)
+    plt.tight_layout()
     return fig
 
 
