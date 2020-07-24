@@ -1,6 +1,6 @@
 defaults:
-  - task: scan_length
-  - model: seq2seq_transformer
+  - task: scan_simple
+  - model: encoder_decoder_rnn
 
 trainer:
   gpus: 1
