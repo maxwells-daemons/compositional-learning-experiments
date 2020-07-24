@@ -1,3 +1,6 @@
 [submodule "SCAN"]
 	path = SCAN
 	url = git@github.com:brendenlake/SCAN.git
+[submodule "recursiveMemNet"]
+	path = recursiveMemNet
+	url = git@github.com:ForoughA/recursiveMemNet.git
