@@ -1,4 +1,0 @@
-# Use 80% of the data for training and 20% for testing, split at random.
-split:
-  train: SCAN/simple_split/tasks_train_simple.txt
-  val: SCAN/simple_split/tasks_test_simple.txt

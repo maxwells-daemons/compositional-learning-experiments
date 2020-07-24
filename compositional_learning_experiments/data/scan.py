@@ -1,7 +1,7 @@
 """
-Code to parse examples from the SCAN dataset into an intermediate representation
-sufficient to reproduce the input & output accurately, as well as convert into other
-forms (such as various network structures).
+Code to work with SCAN data. Includes a parser that converts examples into an
+intermediate representation sufficient to reproduce the input & output accurately, as
+well as convert into other forms (such as various network structures).
 
 Notes
 -----
@@ -45,8 +45,81 @@ from typing import List, Optional, Tuple
 
 import graphviz
 import parsy
+import torchtext
+
+# Derived from the SCAN grammar; see Figure 6/7 of https://arxiv.org/pdf/1711.00350.pdf.
+MAX_INPUT_LENGTH = 9
+MAX_OUTPUT_LENGTH = 50  # NOTE: includes <eos> and <init> tokens
 
 
+def tokenize(string: str) -> List[str]:
+    """
+    Tokenize a string of SCAN text.
+
+    Parameters
+    ----------
+    string : str
+        A line in either the SCAN input or output grammar.
+
+    Returns
+    -------
+    List[str]
+        A list of tokens in the string, including surrounding spaces for reversibility.
+    """
+    return list(map(lambda s: f" {s} ", str.split(string)))
+
+
+FIELDS = {
+    "input": torchtext.data.ReversibleField(
+        sequential=True,
+        fix_length=MAX_INPUT_LENGTH,
+        tokenize=tokenize,
+        pad_token=" <pad> ",
+        unk_token=" <unk> ",
+    ),
+    "target": torchtext.data.ReversibleField(
+        sequential=True,
+        is_target=True,
+        pad_token=" <pad> ",
+        unk_token=" <unk> ",
+        init_token=" <init> ",
+        eos_token=" <eos> ",
+        fix_length=MAX_OUTPUT_LENGTH,
+        tokenize=tokenize,
+    ),
+}
+
+# Closed over by make_example, but precomputed for efficiency
+_FIELDS_ASSOCIATION_LIST = list(FIELDS.items())
+
+# Evaluated at the end of each validation epoch
+TEST_COMMANDS = [
+    "turn left",
+    "turn right",
+    "jump",
+    "walk",
+    "look",
+    "run",
+    "walk left",
+    "run right",
+    "turn right twice",
+    "turn left thrice",
+    "jump left twice",
+    "look right thrice",
+    "turn opposite left",
+    "walk opposite right",
+    "look around left",
+    "jump around right",
+    "walk and run",
+    "look after jump",
+    "walk left and run right",
+    "look twice after jump thrice",
+    "jump opposite left after walk around left",
+    "walk around right thrice after jump opposite left twice",
+]
+
+
+# Dataset code
 def split_example(example: str) -> Tuple[str, str]:
     """
     Split an example from the SCAN dataset into an input/target pair.
@@ -68,6 +141,49 @@ def split_example(example: str) -> Tuple[str, str]:
     return inp, out
 
 
+def make_example(line: str) -> torchtext.data.Example:
+    """
+    Parse a line of text in the SCAN data format into a torchtext Example.
+
+    Parameters
+    ----------
+    line : str
+        A line of text of the format "IN: S1 OUT: S2", where S1 and S2 are strings
+        in the SCAN input / output grammars respectively.
+
+    Returns
+    -------
+    torchtext.data.Example
+        A torchtext Example object containing "input" and "target" fields.
+    """
+    split = split_example(line)
+    return torchtext.data.Example.fromlist(split, _FIELDS_ASSOCIATION_LIST)
+
+
+def get_split(file: str) -> torchtext.data.Dataset:
+    """
+    Create a (non-split) dataset from a file in the SCAN data format.
+
+    Parameters
+    ----------
+    file : str
+        Filename of the data to load.
+
+    Returns
+    -------
+    torchtext.data.Dataset
+        A torchtext Dataset containing Examples with "input" and "target" fields.
+    """
+    with open(file, "r") as f:
+        lines = f.readlines()
+
+    examples = map(make_example, lines)
+    dataset = torchtext.data.Dataset(list(examples), FIELDS)
+
+    return dataset
+
+
+# Parser classes
 class Node(abc.ABC):
     """
     A superclass for all categories in the IR grammar. For a complete description

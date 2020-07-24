@@ -1,15 +1,18 @@
-model:
+model_meta:
   name: AttentionRNN
+  domain: Seq2Seq
+
+model:
   rnn_base: gru
-  d_model: 256
-  num_layers: 2
-  dropout: 0.0
+  d_model: 64
+  num_layers: 1
+  dropout: 0.5
   bidirectional_encoder: true
-  attention_dim: 256
+  attention_dim: 64
 
 training:
   batch_size: 128
-  learning_rate: 1.0e-3
+  learning_rate: 3.0e-4
 
 trainer:
   gradient_clip_val: 1.0

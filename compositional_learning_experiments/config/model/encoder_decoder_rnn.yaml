@@ -1,5 +1,8 @@
-model:
+model_meta:
   name: EncoderDecoderRNN
+  domain: Seq2Seq
+
+model:
   rnn_base: lstm
   d_model: 256
   num_layers: 2
@@ -7,8 +10,8 @@ model:
   bidirectional_encoder: true
 
 training:
-  batch_size: 4
-  learning_rate: 1.0e-3
+  batch_size: 128
+  learning_rate: 6.0e-4
 
 trainer:
-  gradient_clip_val: 5
+  gradient_clip_val: 1.0

@@ -1,7 +1,7 @@
 defaults:
-  - model: transformer
-  - split: simple
+  - task: scan_length
+  - model: seq2seq_transformer
 
 trainer:
   gpus: 1
-  max_epochs: 100
+  max_epochs: 50

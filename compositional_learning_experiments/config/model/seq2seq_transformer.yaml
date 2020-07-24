@@ -1,0 +1,17 @@
+model_meta:
+  name: Seq2SeqTransformer
+  domain: Seq2Seq
+
+model:
+  d_model: 256
+  nhead: 16
+  num_encoder_layers: 6
+  num_decoder_layers: 6
+  dropout: 0.25
+
+training:
+  batch_size: 256
+  learning_rate: 1.0e-3
+
+trainer:
+  gradient_clip_val: 1.0

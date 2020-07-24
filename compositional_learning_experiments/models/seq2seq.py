@@ -1,13 +1,11 @@
 """
-Code to run experiments using the SCAN dataset.
+Code for building and training sequence-to-sequence models.
 """
 
 import abc
-import os
 import math
 from typing import List, Optional, Tuple
 
-import hydra
 import matplotlib.pyplot as plt
 import matplotlib.ticker
 import numpy as np
@@ -18,121 +16,89 @@ import torch.nn
 import torch.utils.tensorboard
 import torchtext
 
-from compositional_learning_experiments import parse_scan
+from compositional_learning_experiments.data import scan
 
-# Derived from the SCAN grammar; see Figure 6/7 of https://arxiv.org/pdf/1711.00350.pdf.
-MAX_INPUT_LENGTH = 9
-MAX_OUTPUT_LENGTH = 50  # NOTE: includes <eos> and <init> tokens
+# Utilities
+def get_rnn_constructor(variant: str):
+    return {"rnn": torch.nn.RNN, "lstm": torch.nn.LSTM, "gru": torch.nn.GRU,}[variant]
 
 
-def tokenize(string: str) -> List[str]:
+def plot_attention(
+    src_string: List[str], generated_string: List[str], attention_map: np.ndarray
+) -> plt.Figure:
     """
-    Tokenize a string of SCAN text.
+    Create a pyplot figure visualizing the attention scores at each step of decoding.
+
+    Adapted from: https://bastings.github.io/annotated_encoder_decoder/.
 
     Parameters
     ----------
-    string : str
-        A line in either the SCAN input or output grammar.
+    src_string : List[str]
+        The input string, as a list of tokens.
+    generated_string : List[str]
+        The generated tokens, including the <eos> token but not the <init> token.
 
     Returns
     -------
-    List[str]
-        A list of tokens in the string, including surrounding spaces for reversibility.
+    plt.Figure
+        A figure displaying the attention map.
     """
-    return list(map(lambda s: f" {s} ", str.split(string)))
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    heatmap = ax.pcolor(attention_map.T, cmap="viridis")
+
+    # put the major ticks at the middle of each cell
+    # and the x-ticks on top
+    ax.xaxis.tick_top()
+    ax.set_xticks(np.arange(attention_map.shape[0]) + 0.5, minor=False)
+    ax.set_yticks(np.arange(attention_map.shape[1]) + 0.5, minor=False)
+    ax.set_xticklabels(generated_string, minor=False, rotation="vertical")
+    ax.set_yticklabels(src_string, minor=False)
+    ax.invert_yaxis()
+
+    plt.colorbar(heatmap)
+    plt.tight_layout()
+    return fig
 
 
-FIELDS = {
-    "input": torchtext.data.ReversibleField(
-        sequential=True,
-        fix_length=MAX_INPUT_LENGTH,
-        tokenize=tokenize,
-        pad_token=" <pad> ",
-        unk_token=" <unk> ",
-    ),
-    "target": torchtext.data.ReversibleField(
-        sequential=True,
-        is_target=True,
-        pad_token=" <pad> ",
-        unk_token=" <unk> ",
-        init_token=" <init> ",
-        eos_token=" <eos> ",
-        fix_length=MAX_OUTPUT_LENGTH,
-        tokenize=tokenize,
-    ),
-}
-
-# Closed over by make_example, but precomputed for efficiency
-_FIELDS_ASSOCIATION_LIST = list(FIELDS.items())
-
-TEST_COMMANDS = [
-    "turn left",
-    "turn right",
-    "jump",
-    "walk",
-    "look",
-    "run",
-    "walk left",
-    "run right",
-    "turn right twice",
-    "turn left thrice",
-    "jump left twice",
-    "look right thrice",
-    "turn opposite left",
-    "walk opposite right",
-    "look around left",
-    "jump around right",
-    "walk and run",
-    "look after jump",
-    "walk left and run right",
-    "look twice after jump thrice",
-    "jump opposite left after walk around left",
-    "walk around right thrice after jump opposite left twice",
-]
-
-
-def make_example(line: str) -> torchtext.data.Example:
+def stack_bidirectional_context(context: torch.Tensor) -> torch.Tensor:
     """
-    Parse a line of text in the SCAN data format into a torchtext Example.
+    Concatenate the forward and backward representations from a bidirectional RNN
+    on the hidden dimension axis.
 
     Parameters
     ----------
-    line : str
-        A line of text of the format "IN: S1 OUT: S2", where S1 and S2 are strings
-        in the SCAN input / output grammars respectively.
+    context : torch.Tensor
+        A tensor with shape [layers * 2, batch_size, dims].
+        May also be a 2-tuple of such tensors (as in an LSTM).
 
     Returns
     -------
-    torchtext.data.Example
-        A torchtext Example object containing "input" and "target" fields.
+    torch.Tensor
+        context reshaped to have shape [layers, batch_size, dims * 2].
     """
-    split = parse_scan.split_example(line)
-    return torchtext.data.Example.fromlist(split, _FIELDS_ASSOCIATION_LIST)
+    if isinstance(context, tuple):  # LSTM; see below for detailed view
+        hidden, cell = context
+        num_layers, batch_size, d_model = hidden.shape
+        num_layers //= 2
+        hidden = hidden.view([num_layers, 2, batch_size, d_model])
+        hidden = hidden.permute([0, 2, 1, 3])
+        hidden = hidden.reshape([num_layers, batch_size, 2 * d_model])
+        cell = cell.view([num_layers, 2, batch_size, d_model])
+        cell = cell.permute([0, 2, 1, 3])
+        cell = cell.reshape([num_layers, batch_size, 2 * d_model])
+        return (hidden, cell)
+    else:  # RNN & GRU
+        num_layers, batch_size, d_model = context.shape
+        num_layers //= 2
+        # [layers * directions, batch, dims] -> [layers, directions, batch, dims]
+        context = context.view([num_layers, 2, batch_size, d_model])
+        # [layers, directions, batch, dims] -> [layers, batch, directions, dims]
+        context = context.permute([0, 2, 1, 3])
+        # [layers, batch, directions, dims] -> [layers, batch, directions * dims]
+        return context.reshape([num_layers, batch_size, 2 * d_model])
 
 
-def scan_dataset(file: str) -> torchtext.data.Dataset:
-    """
-    Create a (non-split) dataset from a file in the SCAN data format.
-
-    Parameters
-    ----------
-    file : str
-        Filename of the data to load.
-
-    Returns
-    -------
-    torchtext.data.Dataset
-        A torchtext Dataset containing Examples with "input" and "target" fields.
-    """
-    with open(file, "r") as f:
-        lines = f.readlines()
-
-    examples = map(make_example, lines)
-    dataset = torchtext.data.Dataset(list(examples), FIELDS)
-
-    return dataset
-
-
+# Components
 class PositionalEncoding(torch.nn.Module):
     """
     Applies sinusoidal positional encoding to an input tensor.
@@ -149,13 +115,13 @@ class PositionalEncoding(torch.nn.Module):
         Dropout to apply to the input.
     """
 
-    def __init__(self, d_model: int, dropout: float):
+    def __init__(self, max_length: int, d_model: int, dropout: float):
         super(PositionalEncoding, self).__init__()
         self.dropout = torch.nn.Dropout(p=dropout)
 
         # Compute the positional encodings once in log space.
-        pe = torch.zeros(MAX_OUTPUT_LENGTH, d_model)
-        position = torch.arange(0, MAX_OUTPUT_LENGTH).unsqueeze(1)
+        pe = torch.zeros(max_length, d_model)
+        position = torch.arange(0, max_length).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model)
         )
@@ -169,44 +135,108 @@ class PositionalEncoding(torch.nn.Module):
         return self.dropout(x)
 
 
-class SCANBase(pl.LightningModule, abc.ABC):
+class BahdanauAttention(torch.nn.Module):
     """
-    An abstract base class for models that will be trained on SCAN.
+    Implement additive attention (Bahdanau et al. 2015).
+
+    Parameters
+    ----------
+    query_size : int
+        The size of vectors that will be turned into queries.
+    key_size : int
+        The size of vectors that will be turned into keys.
+    attention_dim : int
+        The number of internal dimensions to use for the score computation.
+    """
+
+    def __init__(self, query_size: int, key_size: int, attention_dim: int):
+        super().__init__()
+        self.project_query = torch.nn.Linear(query_size, attention_dim)
+        self.project_key = torch.nn.Linear(key_size, attention_dim)
+        self.compute_score = torch.nn.Linear(attention_dim, 1)
+
+    def forward(
+        self,
+        query: Optional[torch.Tensor] = None,
+        query_input: Optional[torch.Tensor] = None,
+        keys: Optional[torch.Tensor] = None,
+        key_inputs: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute the attention scores between a batch of queries and a batch of key
+        sequences.
+
+        Parameters
+        ----------
+        query : Optional[torch.Tensor] (default: None)
+            A precomputed batch of query vectors, of shape [batch_size, attention_dim].
+            Must be defined iff query_input is not.
+        query_input : Optional[torch.Tensor] (default: None)
+            A batch of inputs to be turned into query vectors, of shape
+            [batch_size, query_size]. Must be defined iff query is not.
+        keys : Optional[torch.Tensor] (default: None)
+            A precomputed batch of sequences of key vectors, of shape
+            [sequence_length, batch_size, attention_dim].
+            Must be defined iff key_input is not.
+        key_inputs : Optional[torch.Tensor] (default: None)
+            A batch of sequences of inputs to be turned into key vectors, of shape
+            [sequence_length, batch_size, key_size]. Must be defined iff keys is not.
+        mask : Optional[torch.Tensor] (default: None)
+            A tensor of shape [sequence_length, batch_size] which is 0 for positions
+            which may be attented to and -inf for positions which may not.
+
+        Returns
+        -------
+        torch.Tensor
+            An attention score between each key in the sequence and the query.
+            Has shape [sequence_length, batch_size].
+        """
+        if query_input is None:
+            assert query is not None
+        else:
+            assert query is None
+            query = self.project_query(query_input)
+
+        if key_inputs is None:
+            assert keys is not None
+        else:
+            assert keys is None
+            keys = self.project_key(key_inputs)
+
+        # NOTE: addition is broadcast; there is a single query and a sequence of keys
+        scores = self.compute_score(torch.tanh(query + keys)).squeeze(2)
+
+        if mask is not None:
+            scores += mask
+
+        return scores.softmax(0)
+
+
+class Seq2SeqBase(pl.LightningModule, abc.ABC):
+    """
+    An abstract base class for seq2seq models.
 
     All sequences are assumed to use [SEQUENCE_LENGTH, BATCH_SIZE, DIM] convention.
     This class handles data loading and training/validation conventions.
 
     Parameters
     ----------
+    task_name : str
+        One of the predefined sequence-to-sequence tasks.
     train_dataset : str
         A path to the dataset to train on.
     val_dataset : str
         A path to the dataset to validate on.
     batch_size : int
         Batch size to use for training and validation.
-
-    Attributes
-    ----------
-    input_field : torchtext.data.Field
-        A Field containing vocabulary and parsing information for input text.
-    output_field : torchtext.data.Field
-        A Field containing vocabulary and parsing information for output text.
-    input_pad_i : int
-        Token index of the <pad> character in input text.
-    target_pad_i : int
-        Token index of the <pad> character in output text.
-    target_init_i : int
-        Token index of the <init> character in output text.
-    target_eos_i : int
-        Token index of the <eos> character in output text.
-    train_iter : torchtext.dataset.Iterator
-        An Iterator looping over the training set.
-    val_iter : torchtext.dataset.Iterator
-        An Iterator looping over the validation set.
     """
 
     input_field: torchtext.data.Field
     target_field: torchtext.data.Field
+    input_length: int
+    output_length: int
+    test_inputs: List[str]
     input_pad_i: int
     target_pad_i: int
     target_init_i: int
@@ -215,15 +245,26 @@ class SCANBase(pl.LightningModule, abc.ABC):
     val_iter: torchtext.data.Iterator
 
     def __init__(
-        self, train_dataset: str, val_dataset: str, batch_size: int,
+        self,
+        task_name: str,
+        train_dataset: str,
+        val_dataset: str,
+        batch_size: int,
+        learning_rate: float,
     ):
         super().__init__()
 
-        train_dataset = scan_dataset(train_dataset)
-        val_dataset = scan_dataset(val_dataset)
+        if task_name == "SCAN":
+            train_dataset = scan.get_split(train_dataset)
+            val_dataset = scan.get_split(val_dataset)
+            self.input_field = scan.FIELDS["input"]
+            self.target_field = scan.FIELDS["target"]
+            self.input_length = scan.MAX_INPUT_LENGTH
+            self.output_length = scan.MAX_OUTPUT_LENGTH
+            self.test_inputs = scan.TEST_COMMANDS
+        else:
+            raise ValueError("Unrecognized task")
 
-        self.input_field = FIELDS["input"]
-        self.target_field = FIELDS["target"]
         self.input_field.build_vocab(train_dataset, val_dataset)
         self.target_field.build_vocab(train_dataset, val_dataset)
 
@@ -268,7 +309,7 @@ class SCANBase(pl.LightningModule, abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def infer_greedy(self, src: str) -> str:
+    def infer_greedy(self, src: str, log_step: Optional[int] = None) -> str:
         """
         Infer an output sequence from an input string using greedy decoding.
         NOTE: does not handle <pad> tokens in the input!
@@ -277,6 +318,9 @@ class SCANBase(pl.LightningModule, abc.ABC):
         ----------
         src : str
             An input string in the SCAN input grammar.
+        log_step : Optional[int] (default: None)
+            If provided, the callee may log any additional information they'd
+            like for this step (e.g. attention plots).
 
         Returns
         -------
@@ -370,8 +414,8 @@ class SCANBase(pl.LightningModule, abc.ABC):
         aggregated = pl.loggers.base.merge_dicts(outputs)
         val_metrics = {f"val/{k}": torch.tensor(v) for (k, v) in aggregated.items()}
 
-        for command in TEST_COMMANDS:
-            output = self.infer_greedy(command)
+        for command in self.test_inputs:
+            output = self.infer_greedy(command, self.current_epoch)
             self.logger.experiment.add_text(command, output, self.current_epoch)
 
         return {"log": val_metrics}
@@ -398,49 +442,7 @@ class SCANBase(pl.LightningModule, abc.ABC):
         return self.val_iter
 
 
-def stack_bidirectional_context(context: torch.Tensor) -> torch.Tensor:
-    """
-    Concatenate the forward and backward representations from a bidirectional RNN
-    on the hidden dimension axis.
-
-    Parameters
-    ----------
-    context : torch.Tensor
-        A tensor with shape [layers * 2, batch_size, dims].
-        May also be a 2-tuple of such tensors (as in an LSTM).
-
-    Returns
-    -------
-    torch.Tensor
-        context reshaped to have shape [layers, batch_size, dims * 2].
-    """
-    if isinstance(context, tuple):  # LSTM; see below for detailed view
-        hidden, cell = context
-        num_layers, batch_size, d_model = hidden.shape
-        num_layers //= 2
-        hidden = hidden.view([num_layers, 2, batch_size, d_model])
-        hidden = hidden.permute([0, 2, 1, 3])
-        hidden = hidden.reshape([num_layers, batch_size, 2 * d_model])
-        cell = cell.view([num_layers, 2, batch_size, d_model])
-        cell = cell.permute([0, 2, 1, 3])
-        cell = cell.reshape([num_layers, batch_size, 2 * d_model])
-        return (hidden, cell)
-    else:  # RNN & GRU
-        num_layers, batch_size, d_model = context.shape
-        num_layers //= 2
-        # [layers * directions, batch, dims] -> [layers, directions, batch, dims]
-        context = context.view([num_layers, 2, batch_size, d_model])
-        # [layers, directions, batch, dims] -> [layers, batch, directions, dims]
-        context = context.permute([0, 2, 1, 3])
-        # [layers, batch, directions, dims] -> [layers, batch, directions * dims]
-        return context.reshape([num_layers, batch_size, 2 * d_model])
-
-
-def get_rnn_constructor(variant: str):
-    return {"rnn": torch.nn.RNN, "lstm": torch.nn.LSTM, "gru": torch.nn.GRU,}[variant]
-
-
-class EncoderDecoderRNN(SCANBase):
+class EncoderDecoderRNN(Seq2SeqBase):
     """
     An encoder-decoder ("seq2seq") RNN without attention.
 
@@ -461,6 +463,7 @@ class EncoderDecoderRNN(SCANBase):
 
     def __init__(
         self,
+        task_name: str,
         train_dataset: str,
         val_dataset: str,
         batch_size: int,
@@ -471,7 +474,9 @@ class EncoderDecoderRNN(SCANBase):
         dropout: float,
         bidirectional_encoder: bool,
     ):
-        super().__init__(train_dataset, val_dataset, batch_size)
+        super().__init__(
+            task_name, train_dataset, val_dataset, batch_size, learning_rate
+        )
         self.save_hyperparameters()
         self.hparams.model_name = "EncoderDecoderRNN"
 
@@ -530,12 +535,12 @@ class EncoderDecoderRNN(SCANBase):
         # padding values. These must be ignored later.
         predicted_embeddings, _ = torch.nn.utils.rnn.pad_packed_sequence(
             packed_output,
-            total_length=MAX_OUTPUT_LENGTH - 1,  # Does not predict <init> token
+            total_length=self.output_length - 1,  # Does not predict <init> token
         )
         predicted_logits = self.output(predicted_embeddings)
         return predicted_logits
 
-    def infer_greedy(self, src: str) -> str:
+    def infer_greedy(self, src: str, log_step: Optional[int] = None) -> str:
         src_tokens = self.input_field.preprocess(src)
         src_tensor = self.input_field.numericalize([src_tokens], device=self.device)
 
@@ -550,7 +555,7 @@ class EncoderDecoderRNN(SCANBase):
                 context = stack_bidirectional_context(context)
 
             # Manually unroll decoder with sequence/batch dimensions of 1
-            for _ in range(MAX_OUTPUT_LENGTH):
+            for _ in range(self.output_length):
                 target_enc = self.target_pipeline(generated_tokens[-1])
                 predicted_embeddings, context = self.decoder(
                     target_enc.unsqueeze(0).unsqueeze(0), context
@@ -568,122 +573,7 @@ class EncoderDecoderRNN(SCANBase):
         return torch.optim.RMSprop(self.parameters(), lr=self.hparams.learning_rate)
 
 
-class BahdanauAttention(torch.nn.Module):
-    """
-    Implement additive attention (Bahdanau et al. 2015).
-
-    Parameters
-    ----------
-    query_size : int
-        The size of vectors that will be turned into queries.
-    key_size : int
-        The size of vectors that will be turned into keys.
-    attention_dim : int
-        The number of internal dimensions to use for the score computation.
-    """
-
-    def __init__(self, query_size: int, key_size: int, attention_dim: int):
-        super().__init__()
-        self.project_query = torch.nn.Linear(query_size, attention_dim)
-        self.project_key = torch.nn.Linear(key_size, attention_dim)
-        self.compute_score = torch.nn.Linear(attention_dim, 1)
-
-    def forward(
-        self,
-        query: Optional[torch.Tensor] = None,
-        query_input: Optional[torch.Tensor] = None,
-        keys: Optional[torch.Tensor] = None,
-        key_inputs: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Compute the attention scores between a batch of queries and a batch of key
-        sequences.
-
-        Parameters
-        ----------
-        query : Optional[torch.Tensor] (default: None)
-            A precomputed batch of query vectors, of shape [batch_size, attention_dim].
-            Must be defined iff query_input is not.
-        query_input : Optional[torch.Tensor] (default: None)
-            A batch of inputs to be turned into query vectors, of shape
-            [batch_size, query_size]. Must be defined iff query is not.
-        keys : Optional[torch.Tensor] (default: None)
-            A precomputed batch of sequences of key vectors, of shape
-            [sequence_length, batch_size, attention_dim].
-            Must be defined iff key_input is not.
-        key_inputs : Optional[torch.Tensor] (default: None)
-            A batch of sequences of inputs to be turned into key vectors, of shape
-            [sequence_length, batch_size, key_size]. Must be defined iff keys is not.
-        mask : Optional[torch.Tensor] (default: None)
-            A tensor of shape [sequence_length, batch_size] which is 0 for positions
-            which may be attented to and -inf for positions which may not.
-
-        Returns
-        -------
-        torch.Tensor
-            An attention score between each key in the sequence and the query.
-            Has shape [sequence_length, batch_size].
-        """
-        if query_input is None:
-            assert query is not None
-        else:
-            assert query is None
-            query = self.project_query(query_input)
-
-        if key_inputs is None:
-            assert keys is not None
-        else:
-            assert keys is None
-            keys = self.project_key(key_inputs)
-
-        # NOTE: addition is broadcast; there is a single query and a sequence of keys
-        scores = self.compute_score(torch.tanh(query + keys)).squeeze(2)
-
-        if mask is not None:
-            scores += mask
-
-        return scores.softmax(0)
-
-
-def plot_attention(
-    src_string: List[str], generated_string: List[str], attention_map: np.ndarray
-) -> plt.Figure:
-    """
-    Create a pyplot figure visualizing the attention scores at each step of decoding.
-
-    Adapted from: https://bastings.github.io/annotated_encoder_decoder/.
-
-    Parameters
-    ----------
-    src_string : List[str]
-        The input string, as a list of tokens.
-    generated_string : List[str]
-        The generated tokens, including the <eos> token but not the <init> token.
-
-    Returns
-    -------
-    plt.Figure
-        A figure displaying the attention map.
-    """
-    fig, ax = plt.subplots(figsize=(8, 4.8))
-    heatmap = ax.pcolor(attention_map.T, cmap="viridis")
-
-    # put the major ticks at the middle of each cell
-    # and the x-ticks on top
-    ax.xaxis.tick_top()
-    ax.set_xticks(np.arange(attention_map.shape[0]) + 0.5, minor=False)
-    ax.set_yticks(np.arange(attention_map.shape[1]) + 0.5, minor=False)
-    ax.set_xticklabels(generated_string, minor=False, rotation="vertical")
-    ax.set_yticklabels(src_string, minor=False)
-    ax.invert_yaxis()
-
-    plt.colorbar(heatmap)
-    plt.tight_layout()
-    return fig
-
-
-class AttentionRNN(SCANBase):
+class AttentionRNN(Seq2SeqBase):
     """
     An encoder-decoder ("seq2seq") RNN with attention.
 
@@ -704,6 +594,7 @@ class AttentionRNN(SCANBase):
 
     def __init__(
         self,
+        task_name: str,
         train_dataset: str,
         val_dataset: str,
         batch_size: int,
@@ -715,7 +606,9 @@ class AttentionRNN(SCANBase):
         bidirectional_encoder: bool,
         attention_dim: int,
     ):
-        super().__init__(train_dataset, val_dataset, batch_size)
+        super().__init__(
+            task_name, train_dataset, val_dataset, batch_size, learning_rate
+        )
         self.save_hyperparameters()
         self.hparams.model_name = "AttentionRNN"
 
@@ -769,7 +662,7 @@ class AttentionRNN(SCANBase):
 
         memory, hidden = self.encoder(src_packed)
         memory, _ = torch.nn.utils.rnn.pad_packed_sequence(
-            memory, total_length=MAX_INPUT_LENGTH, padding_value=0.0
+            memory, total_length=self.input_length, padding_value=0.0
         )
         memory_mask = torch.zeros(src.shape, device=self.device)
         memory_mask[torch.where(src == self.input_pad_i)] = -math.inf
@@ -778,7 +671,7 @@ class AttentionRNN(SCANBase):
             hidden = stack_bidirectional_context(hidden)
 
         outputs = []
-        for i in range(MAX_OUTPUT_LENGTH - 1):
+        for i in range(self.output_length - 1):
             # NOTE: we only use the last layer's hidden state to query
             if isinstance(hidden, tuple):
                 query_input = hidden[0][-1]
@@ -795,9 +688,21 @@ class AttentionRNN(SCANBase):
 
         return torch.stack(outputs)
 
-    def infer_greedy(self, src: str) -> str:
-        generated_tensor, _ = self.infer_and_attend_greedy(src)
+    def infer_greedy(self, src: str, log_step: Optional[int] = None) -> str:
+        generated_tensor, attention_map = self.infer_and_attend_greedy(src)
         generated_str = self.target_field.reverse(generated_tensor.unsqueeze(1))[0]
+
+        if log_step:
+            src_tokens = self.input_field.preprocess(src)
+            output = self.target_field.reverse(generated_tensor.unsqueeze(1))[0]
+            # Remove <init> token
+            output_tokens = [
+                self.target_field.vocab.itos[x] for x in generated_tensor[1:]
+            ]
+            fig = plot_attention(src_tokens, output_tokens, attention_map.cpu().numpy())
+            self.logger.experiment.add_figure(src, fig, log_step)
+            plt.clf()
+
         return generated_str
 
     def infer_and_attend_greedy(self, src: str) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -831,7 +736,7 @@ class AttentionRNN(SCANBase):
             if self.hparams.bidirectional_encoder:
                 hidden = stack_bidirectional_context(hidden)
 
-            for _ in range(MAX_OUTPUT_LENGTH - 1):
+            for _ in range(self.output_length - 1):
                 target_enc = self.target_pipeline(generated_tokens[-1]).unsqueeze(0)
                 attention_scores = self.attention(query_input=hidden[-1], keys=keys)
                 context = (attention_scores.unsqueeze(2) * memory).sum(0)
@@ -854,27 +759,8 @@ class AttentionRNN(SCANBase):
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
 
-    # On validation, also plot test command attention maps
-    def validation_epoch_end(self, outputs):
-        aggregated = pl.loggers.base.merge_dicts(outputs)
-        val_metrics = {f"val/{k}": torch.tensor(v) for (k, v) in aggregated.items()}
 
-        for command in TEST_COMMANDS:
-            output_tensor, attention_map = self.infer_and_attend_greedy(command)
-            src_tokens = self.input_field.preprocess(command)
-            output = self.target_field.reverse(output_tensor.unsqueeze(1))[0]
-            # Remove <init> token
-            output_tokens = [self.target_field.vocab.itos[x] for x in output_tensor[1:]]
-            fig = plot_attention(src_tokens, output_tokens, attention_map.cpu().numpy())
-
-            self.logger.experiment.add_text(command, output, self.current_epoch)
-            self.logger.experiment.add_figure(command, fig, self.current_epoch)
-            plt.clf()
-
-        return {"log": val_metrics}
-
-
-class Transformer(SCANBase):
+class Transformer(Seq2SeqBase):
     """
     A typical sequence-to-sequence transformer for the SCAN task.
     Model parameters and forward() are as they are in torch.nn.Transformer.
@@ -882,6 +768,7 @@ class Transformer(SCANBase):
 
     def __init__(
         self,
+        task_name: str,
         train_dataset: str,
         val_dataset: str,
         batch_size: int,
@@ -891,13 +778,18 @@ class Transformer(SCANBase):
         num_encoder_layers: int,
         num_decoder_layers: int,
         dropout: float,
+        epochs: int,
     ):
-        super().__init__(train_dataset, val_dataset, batch_size)
+        super().__init__(
+            task_name, train_dataset, val_dataset, batch_size, learning_rate
+        )
         self.save_hyperparameters()
         self.hparams.model_name = "Transformer"
 
         self.scale = math.sqrt(d_model)
-        self.positional_encoding = PositionalEncoding(d_model, dropout)
+        self.positional_encoding = PositionalEncoding(
+            self.output_length, d_model, dropout
+        )
         self.transformer = torch.nn.Transformer(  # type: ignore
             d_model=d_model,
             nhead=nhead,
@@ -939,7 +831,7 @@ class Transformer(SCANBase):
         predicted_logits = self.output(predicted_embeddings)
         return predicted_logits
 
-    def infer_greedy(self, src: str) -> str:
+    def infer_greedy(self, src: str, log_step: Optional[int] = None) -> str:
         src_tokens = self.input_field.preprocess(src)
         src_tensor = self.input_field.numericalize([src_tokens], device=self.device)
 
@@ -955,7 +847,7 @@ class Transformer(SCANBase):
 
             while (
                 generated_tokens[-1] != self.target_eos_i
-                and generated_tokens.numel() < MAX_OUTPUT_LENGTH
+                and generated_tokens.numel() < self.output_length
             ):
                 future_mask = self.transformer.generate_square_subsequent_mask(
                     generated_tokens.numel()
@@ -973,63 +865,19 @@ class Transformer(SCANBase):
         return self.target_field.reverse(generated_tokens.unsqueeze(1))[0]
 
     def configure_optimizers(self):
-        return torch.optim.Adam(
+        optimizer = torch.optim.Adam(
             self.parameters(),
             lr=self.hparams.learning_rate,
             betas=(0.9, 0.98),
             eps=1e-9,
         )
-
-
-@hydra.main(config_path="config/config.yaml", strict=False)
-def main(cfg: omegaconf.DictConfig):
-    if cfg.model.name == "Transformer":
-        model = Transformer(
-            train_dataset=hydra.utils.to_absolute_path(cfg.split.train),
-            val_dataset=hydra.utils.to_absolute_path(cfg.split.val),
-            batch_size=cfg.training.batch_size,
-            learning_rate=cfg.training.learning_rate,
-            d_model=cfg.model.d_model,
-            nhead=cfg.model.nhead,
-            num_encoder_layers=cfg.model.num_encoder_layers,
-            num_decoder_layers=cfg.model.num_decoder_layers,
-            dropout=cfg.model.dropout,
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.hparams.learning_rate,
+            epochs=self.hparams.epochs,
+            steps_per_epoch=len(self.train_iter),
+            pct_start=0.1,
+            anneal_strategy="linear",
         )
-    elif cfg.model.name == "EncoderDecoderRNN":
-        model = EncoderDecoderRNN(
-            train_dataset=hydra.utils.to_absolute_path(cfg.split.train),
-            val_dataset=hydra.utils.to_absolute_path(cfg.split.val),
-            batch_size=cfg.training.batch_size,
-            learning_rate=cfg.training.learning_rate,
-            rnn_base=cfg.model.rnn_base,
-            d_model=cfg.model.d_model,
-            num_layers=cfg.model.num_layers,
-            dropout=cfg.model.dropout,
-            bidirectional_encoder=cfg.model.bidirectional_encoder,
-        )
-    elif cfg.model.name == "AttentionRNN":
-        model = AttentionRNN(
-            train_dataset=hydra.utils.to_absolute_path(cfg.split.train),
-            val_dataset=hydra.utils.to_absolute_path(cfg.split.val),
-            batch_size=cfg.training.batch_size,
-            learning_rate=cfg.training.learning_rate,
-            rnn_base=cfg.model.rnn_base,
-            d_model=cfg.model.d_model,
-            num_layers=cfg.model.num_layers,
-            dropout=cfg.model.dropout,
-            bidirectional_encoder=cfg.model.bidirectional_encoder,
-            attention_dim=cfg.model.attention_dim,
-        )
-    else:
-        raise ValueError("Unrecognized model type")
 
-    trainer = pl.Trainer(
-        logger=pl.loggers.TensorBoardLogger(os.getcwd(), name="", version=""),
-        checkpoint_callback=pl.callbacks.ModelCheckpoint(monitor="val/loss"),
-        **cfg.trainer,
-    )
-    trainer.fit(model)
-
-
-if __name__ == "__main__":
-    main()
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
