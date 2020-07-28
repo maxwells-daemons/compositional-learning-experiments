@@ -448,7 +448,7 @@ class EncoderDecoderRNN(Seq2SeqBase):
 
     Parameters
     ----------
-    rnn_base : torch.nn.RNNBase constructor
+    rnn_base : str
         A constructor of a class conforming to the interface of torch.nn.RNN.
     d_model : int
         The dimension of embedding and recurrent layers in this model.

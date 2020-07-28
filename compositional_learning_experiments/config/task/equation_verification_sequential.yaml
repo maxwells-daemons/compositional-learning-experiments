@@ -1,0 +1,7 @@
+# Equation verification, with parenthesized sequential data
+task:
+  name: EquationVerificationSequential
+  domain: EquationVerificationSequential
+  train_path: recursiveMemNet/data/40k_train.json
+  val_path: recursiveMemNet/data/40k_val_shallow.json
+  test_path: recursiveMemNet/data/40k_test.json

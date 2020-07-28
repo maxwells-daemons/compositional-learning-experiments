@@ -1,7 +1,7 @@
 defaults:
-  - task: scan_simple
-  - model: encoder_decoder_rnn
+  - task: equation_verification_sequential
+  - model: sequential_symmetric_lstm
 
 trainer:
   gpus: 1
-  max_epochs: 50
+  max_epochs: 30

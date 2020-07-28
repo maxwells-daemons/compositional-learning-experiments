@@ -1,0 +1,17 @@
+model_meta:
+  name: SymmetricLSTM
+  domain: EquationVerificationSequential
+
+model:
+  rnn_base: lstm
+  d_model: 128
+  num_layers: 2
+  bidirectional: true
+  dropout: 0.3
+
+training:
+  batch_size: 128
+  learning_rate: 1.0e-3
+
+trainer:
+  gradient_clip_val: 1.0

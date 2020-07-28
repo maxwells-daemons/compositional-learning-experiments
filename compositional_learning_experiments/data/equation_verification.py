@@ -178,7 +178,12 @@ def tokenize(equation_string: str) -> List[str]:
 
 
 TEXT_FIELD = torchtext.data.ReversibleField(
-    sequential=True, tokenize=tokenize, pad_token=" <pad> ", unk_token=" <unk> ",
+    sequential=True,
+    tokenize=tokenize,
+    pad_token=" <pad> ",
+    unk_token=" <unk> ",
+    init_token=" <init> ",
+    eos_token=" <eos> ",
 )
 TARGET_FIELD = torchtext.data.Field(
     sequential=False, use_vocab=False, dtype=torch.int32, is_target=True
@@ -212,5 +217,27 @@ def get_split_sequence(file: str) -> torchtext.data.Dataset:
         raw_data = json.load(f)
 
     data_flat = itertools.chain.from_iterable(raw_data)
-    examples = list(map(make_sequence_example, data_flat))
+    examples = map(make_sequence_example, data_flat)
     return torchtext.data.Dataset(list(examples), SEQUENCE_FIELDS)
+
+
+def get_split_sequence_lengths(
+    file: str, lengths: Optional[List[int]] = None
+) -> Dict[int, torchtext.data.Dataset]:
+    """
+    Make a collection of sequence-style datasets, indexed by depth, from a data file.
+    """
+    with open(file, "r") as f:
+        raw_data = json.load(f)
+
+    datasets_and_lengths = {}
+    for length, data in enumerate(raw_data):
+        # Skip ignored lengths and empty datasets
+        if (lengths and length not in lengths) or (not data):
+            continue
+
+        examples = map(make_sequence_example, data)
+        dataset = torchtext.data.Dataset(list(examples), SEQUENCE_FIELDS)
+        datasets_and_lengths[length] = dataset
+
+    return datasets_and_lengths

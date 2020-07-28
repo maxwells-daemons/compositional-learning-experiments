@@ -10,7 +10,7 @@ import hydra
 import omegaconf
 import pytorch_lightning as pl
 
-from compositional_learning_experiments.models import seq2seq
+from compositional_learning_experiments.models import seq2seq, equation_verification
 
 
 @hydra.main(config_path="config/config.yaml", strict=False)
@@ -34,6 +34,10 @@ def main(cfg: omegaconf.DictConfig):
         model = seq2seq.AttentionRNN(**args)
     elif cfg.model_meta.name == "Seq2SeqTransformer":
         model = seq2seq.Transformer(epochs=cfg.trainer.max_epochs, **args)
+    elif cfg.model_meta.name == "SymmetricLSTM":
+        model = equation_verification.SymmetricSequenceLSTM(
+            test_dataset=hydra.utils.to_absolute_path(cfg.task.test_path), **args
+        )
     else:
         raise ValueError("Unrecognized model type:", cfg.model_meta.name)
 
