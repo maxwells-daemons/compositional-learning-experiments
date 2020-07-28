@@ -197,7 +197,7 @@ def test(model: pl.LightningModule, trainer: pl.Trainer) -> plt.Figure:
     return fig
 
 
-class SymmetricSequenceLSTM(SequenceBase):
+class SiameseLSTM(SequenceBase):
     """
     Uses a shared RNN encoder to embed both sequences, then compares the representations
     with a symmetric bilinear model.
@@ -240,7 +240,7 @@ class SymmetricSequenceLSTM(SequenceBase):
             test_dataset=test_dataset,
         )
         self.save_hyperparameters()
-        self.hparams.model_name = "SymmetricLSTM"
+        self.hparams.model_name = "SiameseLSTM"
 
         d_output = 2 * d_model if bidirectional else d_model
         self.similarity_metric = SymmetricBilinearForm(d_output)

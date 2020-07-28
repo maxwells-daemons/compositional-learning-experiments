@@ -34,8 +34,8 @@ def main(cfg: omegaconf.DictConfig):
         model = seq2seq.AttentionRNN(**args)
     elif cfg.model_meta.name == "Seq2SeqTransformer":
         model = seq2seq.Transformer(epochs=cfg.trainer.max_epochs, **args)
-    elif cfg.model_meta.name == "SymmetricLSTM":
-        model = equation_verification.SymmetricSequenceLSTM(
+    elif cfg.model_meta.name == "SiameseLSTM":
+        model = equation_verification.SiameseLSTM(
             test_dataset=hydra.utils.to_absolute_path(cfg.task.test_path), **args
         )
     else:

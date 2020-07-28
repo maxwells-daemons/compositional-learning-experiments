@@ -1,6 +1,6 @@
 defaults:
   - task: equation_verification_sequential
-  - model: sequential_symmetric_lstm
+  - model: sequential_siamese_lstm
 
 trainer:
   gpus: 1

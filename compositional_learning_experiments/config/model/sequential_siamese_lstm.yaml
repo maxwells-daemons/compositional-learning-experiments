@@ -1,5 +1,5 @@
 model_meta:
-  name: SymmetricLSTM
+  name: SiameseLSTM
   domain: EquationVerificationSequential
 
 model:
