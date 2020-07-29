@@ -38,6 +38,10 @@ def main(cfg: omegaconf.DictConfig):
         model = equation_verification.SiameseLSTM(
             test_dataset=hydra.utils.to_absolute_path(cfg.task.test_path), **args
         )
+    elif cfg.model_meta.name == "SiameseTransformer":
+        model = equation_verification.SiameseTransformer(
+            test_dataset=hydra.utils.to_absolute_path(cfg.task.test_path), **args
+        )
     else:
         raise ValueError("Unrecognized model type:", cfg.model_meta.name)
 

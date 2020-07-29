@@ -111,13 +111,10 @@ class PositionalEncoding(torch.nn.Module):
     d_model : int
         The last dimension of the input tensor.
         This will also be the dimension of each place's positional encoding.
-    dropout : float
-        Dropout to apply to the input.
     """
 
-    def __init__(self, max_length: int, d_model: int, dropout: float):
+    def __init__(self, max_length: int, d_model: int):
         super(PositionalEncoding, self).__init__()
-        self.dropout = torch.nn.Dropout(p=dropout)
 
         # Compute the positional encodings once in log space.
         pe = torch.zeros(max_length, d_model)
@@ -132,7 +129,7 @@ class PositionalEncoding(torch.nn.Module):
 
     def forward(self, x):
         x = x + self.pe[: x.size(0)]
-        return self.dropout(x)
+        return x
 
 
 class BahdanauAttention(torch.nn.Module):
@@ -787,9 +784,7 @@ class Transformer(Seq2SeqBase):
         self.hparams.model_name = "Transformer"
 
         self.scale = math.sqrt(d_model)
-        self.positional_encoding = PositionalEncoding(
-            self.output_length, d_model, dropout
-        )
+        self.positional_encoding = PositionalEncoding(self.output_length, d_model)
         self.transformer = torch.nn.Transformer(  # type: ignore
             d_model=d_model,
             nhead=nhead,
