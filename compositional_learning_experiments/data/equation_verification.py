@@ -197,6 +197,27 @@ SEQUENCE_FIELDS = {
 }
 _SEQUENCE_ASSOC_LIST = list(SEQUENCE_FIELDS.items())
 
+# fmt: off
+SEQUENCE_TEST_STRINGS = [
+    [" <init> ", " 2 ", " <eos> "],
+    [" <init> ", " ( ", " var_0 ", " ) ", " Pow ", " ( ", " 1/2 ", " ) ", " <eos> "],
+    [
+        " <init> ",
+        " ( ", " ( ", " 1 ", " ) ", " Pow ", " ( ", " 1/2 ", " ) ", " ) ",
+        " Mul ",
+        " ( ", " ( ", " var_1 ", " ) ", " Add ", " ( ", " var_0 ", " ) ", " ) ",
+        " <eos> ",
+    ],
+    [' <init> ',
+     ' ( ', ' ( ', ' var_0 ', ' ) ', ' Pow ', ' ( ', ' 1 ', ' ) ', ' ) ',
+     ' Mul ',
+     ' ( ', ' ( ', ' var_2 ', ' ) ',
+     ' Add ',
+     ' ( ', ' ( ', ' 0 ', ' ) ', ' Add ', ' ( ', ' var_1 ', ' ) ', ' ) ', ' ) ',
+     ' <eos> ']
+]
+# fmt: on
+
 
 def make_sequence_example(example: Dict[str, Any]) -> torchtext.data.Example:
     """

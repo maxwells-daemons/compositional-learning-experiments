@@ -4,7 +4,7 @@ Code for models and training on the equation verification task.
 
 import abc
 import itertools
-from typing import Optional
+from typing import List, Optional
 
 import hydra
 import matplotlib.pyplot as plt
@@ -369,8 +369,6 @@ class SiameseTransformer(SequenceBase):
         Transform a variable-length sequence into a fixed-size embedding vector.
         """
         pad_mask = (sequence == self.pad_i).T
-        # TODO: restore
-        # input_embedding = self.embedding(sequence)
         input_embedding = self.positional_encoding(self.embedding(sequence))
         encoded_sequence = self.encoder(input_embedding, src_key_padding_mask=pad_mask)
         sequence_rep = encoded_sequence[0, :, :]
@@ -385,9 +383,35 @@ class SiameseTransformer(SequenceBase):
         return logit
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+        return optimizer
+
+    def plot_attentions(self, tokens: List[str], log_step: int) -> None:
+        string = "".join(tokens)
+        tokens_tensor = self.text_field.numericalize([tokens], device=self.device)
+        embeddings = self.positional_encoding(self.embedding(tokens_tensor))
+
+        for i, layer in enumerate(self.encoder.layers):
+            attentions = layer.self_attn(embeddings, embeddings, embeddings)[1][0]
+            figure = seq2seq.plot_attention(
+                tokens, tokens, attentions.detach().cpu().numpy()
+            )
+
+            name = f"{string}/layer_{i}"
+            self.logger.experiment.add_figure(name, figure, log_step)
+
+            embeddings = layer(embeddings)
+
+    def validation_epoch_end(self, outputs):
+        aggregated = pl.loggers.base.merge_dicts(outputs)
+        val_metrics = {f"val/{k}": torch.tensor(v) for (k, v) in aggregated.items()}
+
+        for token_set in equation_verification.SEQUENCE_TEST_STRINGS:
+            self.plot_attentions(token_set, self.current_epoch)
+
+        return {"log": val_metrics}
 
 
 # TODO: remove
 if __name__ == "__main__":
-    test_checkpoint("outputs/2020-07-29/11-24-57/checkpoints/epoch=20.ckpt")
+    test_checkpoint("outputs/2020-07-29/13-37-23/checkpoints/epoch=28.ckpt")
