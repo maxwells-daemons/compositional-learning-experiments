@@ -4,3 +4,6 @@
 [submodule "recursiveMemNet"]
 	path = recursiveMemNet
 	url = git@github.com:ForoughA/recursiveMemNet.git
+[submodule "Universal-Transformer-Pytorch"]
+	path = Universal-Transformer-Pytorch
+	url = git@github.com:andreamad8/Universal-Transformer-Pytorch.git
