@@ -4,9 +4,11 @@ model_meta:
 
 model:
   d_model: 64
-  num_layers: 2
-  nhead: 16
+  num_layers: 4
+  nhead: 4
   dropout: 0.0
+  similarity_metric: symmetric_bilinear
+  root_index: true
 
 training:
   batch_size: 128

@@ -8,6 +8,7 @@ model:
   num_layers: 2
   bidirectional: true
   dropout: 0.3
+  similarity_metric: symmetric_bilinear
 
 training:
   batch_size: 128

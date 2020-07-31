@@ -169,6 +169,11 @@ class ExpressionTree:
         return ExpressionTree(root_label, left, right, root_index), new_index
 
 
+TARGET_FIELD = torchtext.data.Field(
+    sequential=False, use_vocab=False, dtype=torch.int32, is_target=True
+)
+
+# Code to produce sequence datasets
 def tokenize(equation_string: str) -> List[str]:
     """
     Tokenize an equation string, including spaces around each token for reversibility.
@@ -185,15 +190,21 @@ TEXT_FIELD = torchtext.data.ReversibleField(
     init_token=" <init> ",
     eos_token=" <eos> ",
 )
-TARGET_FIELD = torchtext.data.Field(
-    sequential=False, use_vocab=False, dtype=torch.int32, is_target=True
+INDEX_FIELD = torchtext.data.Field(
+    sequential=False,
+    use_vocab=False,
+    dtype=torch.long,
+    is_target=False,
+    batch_first=True,
 )
 
-# Code to produce sequence datasets
+
 SEQUENCE_FIELDS = {
     "left": TEXT_FIELD,
     "right": TEXT_FIELD,
     "target": TARGET_FIELD,
+    "left_root_index": INDEX_FIELD,
+    "right_root_index": INDEX_FIELD,
 }
 _SEQUENCE_ASSOC_LIST = list(SEQUENCE_FIELDS.items())
 
@@ -219,15 +230,35 @@ SEQUENCE_TEST_STRINGS = [
 # fmt: on
 
 
+def sequence_root_index(example: ExpressionTree) -> int:
+    """
+    Get the index of the root token in a sequence expression.
+    """
+    if example.left is None or example.right is None:
+        return 1  # Just the <init> token
+
+    return len(tokenize(str(example.left))) + 3  # <init> token and () around left
+
+
 def make_sequence_example(example: Dict[str, Any]) -> torchtext.data.Example:
     """
     Make a Sequence-style example from a serialized equation verification example.
     """
     tree = ExpressionTree.from_serialized(example["equation"])
+    assert tree.left is not None
+    assert tree.right is not None
     left = str(tree.left)
     right = str(tree.right)
     label = int(example["label"] == "1")
-    return torchtext.data.Example.fromlist([left, right, label], _SEQUENCE_ASSOC_LIST)
+
+    left_root_index = sequence_root_index(tree.left)
+    right_root_index = sequence_root_index(tree.right)
+    assert tokenize(tree.left.label)[0] == tokenize(left)[left_root_index - 1]
+    assert tokenize(tree.right.label)[0] == tokenize(right)[right_root_index - 1]
+
+    return torchtext.data.Example.fromlist(
+        [left, right, label, left_root_index, right_root_index], _SEQUENCE_ASSOC_LIST
+    )
 
 
 def get_split_sequence(file: str) -> torchtext.data.Dataset:

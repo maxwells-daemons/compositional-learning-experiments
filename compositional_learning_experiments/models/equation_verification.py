@@ -4,6 +4,7 @@ Code for models and training on the equation verification task.
 
 import abc
 import itertools
+import math
 from typing import List, Optional
 
 import hydra
@@ -54,6 +55,14 @@ class SymmetricBilinearForm(torch.nn.Module):
         # Avoid doubling variance of diagonal elements
         bilinear_weights = (upper_weights + upper_weights.triu(1).T).unsqueeze(0)
         return torch.nn.functional.bilinear(vec_1, vec_2, bilinear_weights).squeeze(1)
+
+
+class DotProductSimilarity(torch.nn.Module):
+    def __init__(self):
+        super(DotProductSimilarity, self).__init__()
+
+    def forward(self, vec_1, vec_2):
+        return (vec_1 * vec_2).sum(1)
 
 
 class SequenceBase(pl.LightningModule, abc.ABC):
@@ -116,17 +125,15 @@ class SequenceBase(pl.LightningModule, abc.ABC):
         }
 
     @abc.abstractmethod
-    def forward(self, vec_1: torch.Tensor, vec_2: torch.Tensor) -> torch.Tensor:
+    def forward(self, batch: torchtext.data.Batch) -> torch.Tensor:
         """
         Given two batches of vectors of the same shape, compute the batch of
         elementwise similarities.
 
         Parameters
         ----------
-        vec_1 : torch.Tensor
-            The first batch of vectors, with shape [batch_size, self.dims].
-        vec_1 : torch.Tensor
-            The seocnd batch of vectors, with shape [batch_size, self.dims].
+        batch : torchtext.data.Batch
+            A batch of sequence-format input data.
 
         Returns
         -------
@@ -140,7 +147,7 @@ class SequenceBase(pl.LightningModule, abc.ABC):
         raise NotImplementedError
 
     def training_step(self, batch, batch_idx):
-        logit = self(batch.left, batch.right)
+        logit = self(batch)
         target = batch.target.type_as(logit)
         loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, target)
         accuracy = ((logit.detach() > 0) == batch.target).float().mean()
@@ -149,7 +156,7 @@ class SequenceBase(pl.LightningModule, abc.ABC):
 
     # Validation
     def validation_step(self, batch, batch_idx):
-        logit = self(batch.left, batch.right)
+        logit = self(batch)
         target = batch.target.type_as(logit)
         loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, target)
         accuracy = ((logit > 0) == batch.target).float().mean()
@@ -164,7 +171,7 @@ class SequenceBase(pl.LightningModule, abc.ABC):
 
     # Testing
     def test_step(self, batch, batch_idx):
-        logit = self(batch.left, batch.right)
+        logit = self(batch)
         target = batch.target.type_as(logit)
         loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, target)
         accuracy = ((logit > 0) == batch.target).float().mean()
@@ -233,7 +240,11 @@ class SiameseLSTM(SequenceBase):
     bidirectional : bool
         If true, the encoder is bidirectional and the decoder is twice as wide
         (to ensure the hidden dimensions match).
+    similarity_metric : str
+        Which similarity metric to use. One of ["dot_product", "symmetric_bilinear"].
     """
+
+    similarity_metric: torch.nn.Module
 
     def __init__(
         self,
@@ -245,6 +256,7 @@ class SiameseLSTM(SequenceBase):
         num_layers: int,
         dropout: float,
         bidirectional: bool,
+        similarity_metric: str,
         train_dataset: str = "recursiveMemNet/data/40k_train.json",
         val_dataset: str = "recursiveMemNet/data/40k_val_shallow.json",
         test_dataset: str = "recursiveMemNet/data/40k_test.json",
@@ -261,7 +273,14 @@ class SiameseLSTM(SequenceBase):
         self.hparams.model_name = "SiameseLSTM"
 
         d_output = 2 * d_model if bidirectional else d_model
-        self.similarity_metric = SymmetricBilinearForm(d_output)
+
+        if similarity_metric == "dot_product":
+            self.similarity_metric = DotProductSimilarity()
+        elif similarity_metric == "symmetric_bilinear":
+            self.similarity_metric = SymmetricBilinearForm(d_output)
+        else:
+            raise ValueError("Unrecognized similarity metric")
+
         self.dropout = torch.nn.Dropout(p=dropout)
         self.embedding = torch.nn.Embedding(
             num_embeddings=len(self.text_field.vocab),
@@ -278,7 +297,6 @@ class SiameseLSTM(SequenceBase):
             dropout=dropout,
         )
 
-    # Training
     def embed_sequence(self, sequence: torch.Tensor) -> torch.Tensor:
         """
         Transform a variable-length sequence into a fixed-size embedding vector.
@@ -303,11 +321,9 @@ class SiameseLSTM(SequenceBase):
 
         return hidden
 
-    def forward(
-        self, left_sequence: torch.Tensor, right_sequence: torch.Tensor
-    ) -> torch.Tensor:
-        left_embed = self.dropout(self.embed_sequence(left_sequence))
-        right_embed = self.dropout(self.embed_sequence(right_sequence))
+    def forward(self, batch: torchtext.data.Batch) -> torch.Tensor:
+        left_embed = self.dropout(self.embed_sequence(batch.left))
+        right_embed = self.dropout(self.embed_sequence(batch.right))
         logit = self.similarity_metric(left_embed, right_embed)
         return logit
 
@@ -320,7 +336,25 @@ class SiameseTransformer(SequenceBase):
     Use a shared Transformer encoder to encode both sequences, using the representation
     at the <init> token as the sequence representation, and compre with a symmetric
     bilinear model.
+
+    Parameters
+    ----------
+    d_model : int
+        The dimension of embedding and transformer layers in this model.
+    nhead : int
+        Number of heads in each self-attention step.
+    dropout : float
+        How much dropout to apply in the embedding and transformer layers.
+    num_layers : int
+        The number of stacked recurrent layers in the input and output RNNs.
+    similarity_metric : str
+        Which similarity metric to use. One of ["dot_product", "symmetric_bilinear"].
+    root_representation : bool
+        If true, the representation of the sequence is taken from the root token.
+        Otherwise, it is taken from the <init> token.
     """
+
+    similarity_metric: torch.nn.Module
 
     def __init__(
         self,
@@ -331,6 +365,8 @@ class SiameseTransformer(SequenceBase):
         nhead: int,
         dropout: float,
         num_layers: int,
+        similarity_metric: str,
+        root_representation: bool,
         train_dataset: str = "recursiveMemNet/data/40k_train.json",
         val_dataset: str = "recursiveMemNet/data/40k_val_shallow.json",
         test_dataset: str = "recursiveMemNet/data/40k_test.json",
@@ -346,13 +382,20 @@ class SiameseTransformer(SequenceBase):
         self.save_hyperparameters()
         self.hparams.model_name = "SiameseTransformer"
 
-        self.similarity_metric = SymmetricBilinearForm(d_model)
+        if similarity_metric == "dot_product":
+            self.similarity_metric = DotProductSimilarity()
+        elif similarity_metric == "symmetric_bilinear":
+            self.similarity_metric = SymmetricBilinearForm(d_model)
+        else:
+            raise ValueError("Unrecognized similarity metric")
+
         self.embedding = torch.nn.Embedding(
             num_embeddings=len(self.text_field.vocab),
             embedding_dim=d_model,
             padding_idx=self.pad_i,
         )
 
+        self.dropout = torch.nn.Dropout(p=dropout)
         self.positional_encoding = seq2seq.PositionalEncoding(
             self.max_input_length, d_model
         )
@@ -364,21 +407,47 @@ class SiameseTransformer(SequenceBase):
             encoder_layer, num_layers, encoder_norm
         )
 
-    def embed_sequence(self, sequence: torch.Tensor) -> torch.Tensor:
+    def embed_token(self, sequence: torch.Tensor) -> torch.Tensor:
+        embedded = self.embedding(sequence)
+        scaled = embedded * math.sqrt(self.hparams.d_model)
+        dropped = self.dropout(scaled)
+        return self.positional_encoding(dropped)
+
+    def embed_sequence(
+        self, sequence: torch.Tensor, root_index: torch.Tensor
+    ) -> torch.Tensor:
         """
         Transform a variable-length sequence into a fixed-size embedding vector.
+
+        Parameters
+        ----------
+        sequence : torch.Tensor
+            A sequence of token indices, of shape [sequence_length, batch].
+        root_index : torch.Tensor
+            The index in each sequence where the root token is, of shape [batch].
+
+        Returns
+        -------
+        torch.Tensor
+            A fixed-size representation of each sequence, of size [batch, d_model].
         """
         pad_mask = (sequence == self.pad_i).T
-        input_embedding = self.positional_encoding(self.embedding(sequence))
+        input_embedding = self.embed_token(sequence)
         encoded_sequence = self.encoder(input_embedding, src_key_padding_mask=pad_mask)
-        sequence_rep = encoded_sequence[0, :, :]
-        return sequence_rep
 
-    def forward(
-        self, left_sequence: torch.Tensor, right_sequence: torch.Tensor
-    ) -> torch.Tensor:
-        left_embed = self.embed_sequence(left_sequence)
-        right_embed = self.embed_sequence(right_sequence)
+        if self.hparams.root_representation:
+            # Sequence representation index varies by batch element (root_index)
+            gather_index = (
+                root_index.unsqueeze(1).repeat(1, self.hparams.d_model).unsqueeze(0)
+            )
+            return encoded_sequence.gather(0, gather_index).squeeze(0)
+
+        # Sequence representation is the starting <index> token
+        return encoded_sequence[0, :, :]
+
+    def forward(self, batch: torchtext.data.Batch) -> torch.Tensor:
+        left_embed = self.embed_sequence(batch.left, batch.left_root_index)
+        right_embed = self.embed_sequence(batch.right, batch.right_root_index)
         logit = self.similarity_metric(left_embed, right_embed)
         return logit
 
@@ -414,4 +483,4 @@ class SiameseTransformer(SequenceBase):
 
 # TODO: remove
 if __name__ == "__main__":
-    test_checkpoint("outputs/2020-07-29/13-37-23/checkpoints/epoch=28.ckpt")
+    test_checkpoint("outputs/2020-07-31/02-01-02/checkpoints/epoch=29.ckpt")
