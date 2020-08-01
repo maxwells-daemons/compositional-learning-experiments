@@ -1,0 +1,7 @@
+# Equation verification, with tree-structured data
+task:
+  name: EquationVerificationTree
+  domain: EquationVerificationTree
+  train_path: recursiveMemNet/data/40k_train.json
+  val_path: recursiveMemNet/data/40k_val_shallow.json
+  test_path: recursiveMemNet/data/40k_test.json

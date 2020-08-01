@@ -1,0 +1,13 @@
+model_meta:
+  name: TreeRNN
+  domain: EquationVerificationTree
+
+model:
+  d_model: 64
+  dropout: 0.0
+  num_layers: 2
+  similarity_metric: symmetric_bilinear
+
+training:
+  batch_size: 1
+  learning_rate: 1.0e-3

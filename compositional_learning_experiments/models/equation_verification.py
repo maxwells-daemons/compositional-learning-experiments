@@ -66,6 +66,17 @@ class DotProductSimilarity(torch.nn.Module):
         return (vec_1 * vec_2).sum(1)
 
 
+def make_similarity_metric(name: str, dims: Optional[int]):
+    if name == "dot_product":
+        return DotProductSimilarity()
+
+    if name == "symmetric_bilinear":
+        assert dims is not None
+        return SymmetricBilinearForm(dims)
+
+    raise ValueError("Unrecognized similarity metric")
+
+
 # Sequence models
 class SequenceBase(pl.LightningModule, abc.ABC):
     """
@@ -276,20 +287,13 @@ class SiameseLSTM(SequenceBase):
 
         d_output = 2 * d_model if bidirectional else d_model
 
-        if similarity_metric == "dot_product":
-            self.similarity_metric = DotProductSimilarity()
-        elif similarity_metric == "symmetric_bilinear":
-            self.similarity_metric = SymmetricBilinearForm(d_output)
-        else:
-            raise ValueError("Unrecognized similarity metric")
-
+        self.similarity_metric = make_similarity_metric(similarity_metric, d_output)
         self.dropout = torch.nn.Dropout(p=dropout)
         self.embedding = torch.nn.Embedding(
             num_embeddings=len(self.text_field.vocab),
             embedding_dim=d_model,
             padding_idx=self.pad_i,
         )
-
         rnn_base_constructor = seq2seq.get_rnn_constructor(rnn_base)
         self.encoder = rnn_base_constructor(
             input_size=d_model,
@@ -384,19 +388,12 @@ class SiameseTransformer(SequenceBase):
         self.save_hyperparameters()
         self.hparams.model_name = "SiameseTransformer"
 
-        if similarity_metric == "dot_product":
-            self.similarity_metric = DotProductSimilarity()
-        elif similarity_metric == "symmetric_bilinear":
-            self.similarity_metric = SymmetricBilinearForm(d_model)
-        else:
-            raise ValueError("Unrecognized similarity metric")
-
+        self.similarity_metric = make_similarity_metric(similarity_metric, d_model)
         self.embedding = torch.nn.Embedding(
             num_embeddings=len(self.text_field.vocab),
             embedding_dim=d_model,
             padding_idx=self.pad_i,
         )
-
         self.dropout = torch.nn.Dropout(p=dropout)
         self.positional_encoding = seq2seq.PositionalEncoding(
             self.max_input_length, d_model
@@ -513,6 +510,8 @@ class TreeBase(pl.LightningModule, abc.ABC):
         )
         self.val_dataset = equation_verification.TreeCurriculum(val_dataset)
 
+        # TODO: test splits
+
         self.leaf_vocab = torchtext.vocab.Vocab(
             Counter(self.train_dataset.leaf_vocab.union(self.val_dataset.leaf_vocab))
         )
@@ -539,8 +538,8 @@ class TreeBase(pl.LightningModule, abc.ABC):
 
     def training_step(self, example, batch_idx):
         tree, label = example
-        target = label.type_as(logit)
         logit = self(tree)
+        target = label.type_as(logit)
         loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, target)
         accuracy = ((logit.detach() > 0) == label).float().mean()
 
@@ -549,8 +548,8 @@ class TreeBase(pl.LightningModule, abc.ABC):
     # Validation
     def validation_step(self, example, batch_idx):
         tree, label = example
-        target = label.type_as(logit)
         logit = self(tree)
+        target = label.type_as(logit)
         loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, target)
         accuracy = ((logit > 0) == label).float().mean()
 
@@ -562,9 +561,117 @@ class TreeBase(pl.LightningModule, abc.ABC):
 
         return {"log": val_metrics}
 
+    # Testing
+    def test_step(self, example, batch_idx):
+        tree, label = example
+        logit = self(tree)
+        target = torch.tensor(label).type_as(logit)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, target)
+        accuracy = ((logit > 0) == label).float().mean()
+
+        return {"loss": loss.cpu(), "accuracy": accuracy.cpu()}
+
+    def test_epoch_end(self, outputs):
+        aggregated = pl.loggers.base.merge_dicts(outputs)
+        test_metrics = {f"test/{k}": torch.tensor(v) for (k, v) in aggregated.items()}
+
+        return {"log": test_metrics}
+
     # Data
     def train_dataloader(self):
         return torch.utils.data.DataLoader(self.train_dataset, batch_size=None)
 
     def val_dataloader(self):
         return torch.utils.data.DataLoader(self.val_dataset, batch_size=None)
+
+
+class TreeRNN(TreeBase):
+    """
+    TODO
+    """
+
+    def __init__(
+        self,
+        task_name: str,
+        learning_rate: float,
+        d_model: int,
+        dropout: float,
+        num_layers: int,
+        similarity_metric: str,
+        epochs: int,
+        train_dataset: str = "recursiveMemNet/data/40k_train.json",
+        val_dataset: str = "recursiveMemNet/data/40k_val_shallow.json",
+        test_dataset: str = "recursiveMemNet/data/40k_test.json",
+        batch_size: int = 1,
+    ):
+        super().__init__(
+            task_name=task_name,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            epochs=epochs,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            test_dataset=test_dataset,
+        )
+        self.save_hyperparameters()
+        self.hparams.model_name = "TreeRNN"
+
+        self.similarity_metric = make_similarity_metric(similarity_metric, d_model)
+        self.dropout = torch.nn.Dropout(p=dropout)
+        self.leaf_embedding = torch.nn.Embedding(
+            num_embeddings=len(self.leaf_vocab), embedding_dim=d_model,
+        )
+
+        def make_layer(in_dim, out_dim, output):
+            sublayers = [torch.nn.Linear(in_dim, out_dim)]
+            if not output:
+                sublayers.append(torch.nn.ReLU())
+            sublayers.append(self.dropout)
+            return torch.nn.Sequential(*sublayers)
+
+        def make_module(in_dim):
+            layers = [make_layer(in_dim, in_dim, False) for _ in range(num_layers - 1)]
+            layers.append(make_layer(in_dim, d_model, True))
+            return torch.nn.Sequential(*layers)
+
+        self.unary_modules = torch.nn.ModuleDict(
+            {name: make_module(d_model) for name in self.unary_vocab.itos}
+        )
+        self.binary_modules = torch.nn.ModuleDict(
+            {name: make_module(2 * d_model) for name in self.binary_vocab.itos}
+        )
+
+    def embed_tree(self, tree: equation_verification.ExpressionTree) -> torch.Tensor:
+        """
+        TODO
+        """
+        if tree.left is None and tree.right is None:
+            index = self.leaf_vocab.stoi[tree.label]
+            return self.leaf_embedding(torch.tensor(index, device=self.device))
+
+        if tree.left is None:
+            right_rep = self.embed_tree(tree.right)
+            module = self.unary_modules[tree.label]
+            return module(right_rep)
+
+        if tree.right is None:
+            left_rep = self.embed_tree(tree.left)
+            module = self.unary_modules[tree.label]
+            return module(left_rep)
+
+        left_rep = self.embed_tree(tree.left)
+        right_rep = self.embed_tree(tree.right)
+        combined_rep = torch.cat([left_rep, right_rep])
+        module = self.binary_modules[tree.label]
+        return module(combined_rep)
+
+    def forward(self, tree: equation_verification.ExpressionTree) -> torch.Tensor:
+        left_embed = self.embed_tree(tree.left)
+        right_embed = self.embed_tree(tree.right)
+        logit = self.similarity_metric(
+            left_embed.unsqueeze(0), right_embed.unsqueeze(0)
+        ).squeeze()
+        return logit
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
