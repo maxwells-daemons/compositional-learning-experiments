@@ -13,7 +13,7 @@ The task is to predict whether the two expressions are equivalent.
 
 import itertools
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import graphviz
 import torch
@@ -171,6 +171,55 @@ class ExpressionTree:
         new_index = max(root_index, left_index, right_index)
         return ExpressionTree(root_label, left, right, root_index), new_index
 
+    def leaf_vocab(self) -> Set[str]:
+        """
+        Get the set of leaf tokens under this subtree.
+        """
+        if self.left is None:
+            if self.right is None:
+                return {self.label}
+
+            return self.right.leaf_vocab()
+
+        if self.right is None:
+            return self.left.leaf_vocab()
+
+        return self.left.leaf_vocab().union(self.right.leaf_vocab())
+
+    def unary_vocab(self) -> Set[str]:
+        """
+        Get the set of of unary functions under this subtree.
+        """
+        if self.left is None:
+            if self.right is None:
+                return set()
+
+            return {self.label}.union(self.right.unary_vocab())
+
+        if self.right is None:
+            return {self.label}.union(self.left.unary_vocab())
+
+        return self.left.unary_vocab().union(self.right.unary_vocab())
+
+    def binary_vocab(self) -> Set[str]:
+        """
+        Get the set of of binary functions under this subtree.
+        """
+        if self.left is None:
+            if self.right is None:
+                return set()
+
+            return self.right.binary_vocab()
+
+        if self.right is None:
+            return self.left.binary_vocab()
+
+        return (
+            {self.label}
+            .union(self.left.binary_vocab())
+            .union(self.right.binary_vocab())
+        )
+
 
 TARGET_FIELD = torchtext.data.Field(
     sequential=False, use_vocab=False, dtype=torch.int32, is_target=True
@@ -312,22 +361,31 @@ class TreeCurriculum(torch.utils.data.IterableDataset):  # type: ignore
 
     def __init__(self, file: str, repeats: int = 1):
         super(TreeCurriculum, self).__init__()
+
         with open(file, "r") as f:
             raw_data = json.load(f)
+
+        self.leaf_vocab: Set[str] = set()
+        self.unary_vocab: Set[str] = set()
+        self.binary_vocab: Set[str] = set()
 
         self.data = []
         for split in raw_data:
             if not split:
                 continue
 
-            deserialized = list(map(self.deserialize, split))
+            deserialized = []
+            for serialized in split:
+                tree = ExpressionTree.from_serialized(serialized["equation"])
+                label = torch.tensor(serialized["label"] == "1")
+                example = (tree, label)
+                deserialized.append(example)
+
+                self.leaf_vocab = self.leaf_vocab.union(tree.leaf_vocab())
+                self.binary_vocab = self.binary_vocab.union(tree.binary_vocab())
+                self.unary_vocab = self.unary_vocab.union(tree.unary_vocab())
+
             self.data.extend(deserialized * repeats)
 
     def __iter__(self):
         return iter(self.data)
-
-    @staticmethod
-    def deserialize(serialized):
-        tree = ExpressionTree.from_serialized(serialized["equation"])
-        label = torch.tensor(serialized["label"] == "1")
-        return (tree, label)

@@ -3,6 +3,7 @@ Code for models and training on the equation verification task.
 """
 
 import abc
+from collections import Counter
 import itertools
 import math
 from typing import List, Optional
@@ -511,6 +512,18 @@ class TreeBase(pl.LightningModule, abc.ABC):
             train_dataset, repeats=epochs
         )
         self.val_dataset = equation_verification.TreeCurriculum(val_dataset)
+
+        self.leaf_vocab = torchtext.vocab.Vocab(
+            Counter(self.train_dataset.leaf_vocab.union(self.val_dataset.leaf_vocab))
+        )
+        self.unary_vocab = torchtext.vocab.Vocab(
+            Counter(self.train_dataset.unary_vocab.union(self.val_dataset.unary_vocab))
+        )
+        self.binary_vocab = torchtext.vocab.Vocab(
+            Counter(
+                self.train_dataset.binary_vocab.union(self.val_dataset.binary_vocab)
+            )
+        )
 
     @abc.abstractmethod
     def forward(self, tree: equation_verification.ExpressionTree) -> torch.Tensor:
