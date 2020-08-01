@@ -19,6 +19,9 @@ import graphviz
 import torch
 import torchtext
 
+TRAIN_DEPTHS = [1, 2, 3, 4, 5, 6, 7]
+TEST_DEPTHS = [8, 9, 10, 11, 12, 13, 14, 15]
+
 
 def to_token(func: str, var: str) -> str:
     """
@@ -273,9 +276,7 @@ def get_split_sequence(file: str) -> torchtext.data.Dataset:
     return torchtext.data.Dataset(list(examples), SEQUENCE_FIELDS)
 
 
-def get_split_sequence_lengths(
-    file: str, lengths: Optional[List[int]] = None
-) -> Dict[int, torchtext.data.Dataset]:
+def get_split_sequence_lengths(file: str) -> Dict[int, torchtext.data.Dataset]:
     """
     Make a collection of sequence-style datasets, indexed by depth, from a data file.
     """
@@ -284,8 +285,7 @@ def get_split_sequence_lengths(
 
     datasets_and_lengths = {}
     for length, data in enumerate(raw_data):
-        # Skip ignored lengths and empty datasets
-        if (lengths and length not in lengths) or (not data):
+        if not data:
             continue
 
         examples = map(make_sequence_example, data)
@@ -293,3 +293,41 @@ def get_split_sequence_lengths(
         datasets_and_lengths[length] = dataset
 
     return datasets_and_lengths
+
+
+# Code to produce tree datasets
+class TreeCurriculum(torch.utils.data.IterableDataset):  # type: ignore
+    """
+    A dataset yielding single tree examples in a fixed curriculum of increasing depth.
+    Note that these examples cannot be batched in their current form.
+
+    Parameters
+    ----------
+    file : str
+        File to load trees from.
+    repeats : int
+        How many times to repeat each stage of the curriculum.
+        Equivalent to epoch count.
+    """
+
+    def __init__(self, file: str, repeats: int = 1):
+        super(TreeCurriculum, self).__init__()
+        with open(file, "r") as f:
+            raw_data = json.load(f)
+
+        self.data = []
+        for split in raw_data:
+            if not split:
+                continue
+
+            deserialized = list(map(self.deserialize, split))
+            self.data.extend(deserialized * repeats)
+
+    def __iter__(self):
+        return iter(self.data)
+
+    @staticmethod
+    def deserialize(serialized):
+        tree = ExpressionTree.from_serialized(serialized["equation"])
+        label = torch.tensor(serialized["label"] == "1")
+        return (tree, label)

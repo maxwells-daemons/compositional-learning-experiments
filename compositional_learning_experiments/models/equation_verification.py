@@ -65,6 +65,7 @@ class DotProductSimilarity(torch.nn.Module):
         return (vec_1 * vec_2).sum(1)
 
 
+# Sequence models
 class SequenceBase(pl.LightningModule, abc.ABC):
     """
     An abstract base class for sequence-style equation verification models.
@@ -481,6 +482,76 @@ class SiameseTransformer(SequenceBase):
         return {"log": val_metrics}
 
 
-# TODO: remove
-if __name__ == "__main__":
-    test_checkpoint("outputs/2020-07-31/02-01-02/checkpoints/epoch=29.ckpt")
+# Tree models
+class TreeBase(pl.LightningModule, abc.ABC):
+    """
+    An abstract base class for tree-style equation verification models.
+    Because these models compute on nonhomogenous trees, they do not support batching.
+
+    NOTE: because these models rely on curriculum learning, they must be run for
+    1 epoch and have the repeats of each depth set in the constructor.
+    """
+
+    def __init__(
+        self,
+        task_name: str,
+        learning_rate: float,
+        epochs: int,
+        train_dataset: str = "recursiveMemNet/data/40k_train.json",
+        val_dataset: str = "recursiveMemNet/data/40k_val_shallow.json",
+        test_dataset: str = "recursiveMemNet/data/40k_test.json",
+        batch_size: int = 1,  # Present for compatibility with the existing interface
+    ):
+        super().__init__()
+
+        if batch_size != 1:
+            raise ValueError("Tree models do not support batching")
+
+        self.train_dataset = equation_verification.TreeCurriculum(
+            train_dataset, repeats=epochs
+        )
+        self.val_dataset = equation_verification.TreeCurriculum(val_dataset)
+
+    @abc.abstractmethod
+    def forward(self, tree: equation_verification.ExpressionTree) -> torch.Tensor:
+        """
+        Given an expression tree rooted at equality and with extant left and right
+        subtrees, return the logit that the two subtrees evaluate to the same quantity.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def configure_optimizers(self):
+        raise NotImplementedError
+
+    def training_step(self, example, batch_idx):
+        tree, label = example
+        target = label.type_as(logit)
+        logit = self(tree)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, target)
+        accuracy = ((logit.detach() > 0) == label).float().mean()
+
+        return {"loss": loss, "log": {"train/loss": loss, "train/accuracy": accuracy}}
+
+    # Validation
+    def validation_step(self, example, batch_idx):
+        tree, label = example
+        target = label.type_as(logit)
+        logit = self(tree)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, target)
+        accuracy = ((logit > 0) == label).float().mean()
+
+        return {"loss": loss.cpu(), "accuracy": accuracy.cpu()}
+
+    def validation_epoch_end(self, outputs):
+        aggregated = pl.loggers.base.merge_dicts(outputs)
+        val_metrics = {f"val/{k}": torch.tensor(v) for (k, v) in aggregated.items()}
+
+        return {"log": val_metrics}
+
+    # Data
+    def train_dataloader(self):
+        return torch.utils.data.DataLoader(self.train_dataset, batch_size=None)
+
+    def val_dataloader(self):
+        return torch.utils.data.DataLoader(self.val_dataset, batch_size=None)
