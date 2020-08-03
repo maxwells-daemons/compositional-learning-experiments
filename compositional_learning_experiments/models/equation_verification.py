@@ -5,11 +5,13 @@ Code for models and training on the equation verification task.
 import abc
 from collections import Counter
 import itertools
+import json
 import math
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import hydra
 import matplotlib.pyplot as plt
+import numpy as np
 import pytorch_lightning as pl
 import torch
 import torchtext
@@ -117,9 +119,6 @@ class SequenceBase(pl.LightningModule, abc.ABC):
         self.init_i = self.text_field.vocab.stoi[self.text_field.init_token]
         self.eos_i = self.text_field.vocab.stoi[self.text_field.eos_token]
 
-        def batch_sort_key(example):  # Sort batches to minimize worst-case padding
-            return max(len(example.left), len(example.right))
-
         def make_iterator(ds, train):
             return torchtext.data.BucketIterator(
                 ds,
@@ -127,7 +126,7 @@ class SequenceBase(pl.LightningModule, abc.ABC):
                 device=self.device,
                 train=train,
                 shuffle=train,
-                sort_key=batch_sort_key,
+                sort_key=self.batch_sort_key,
             )
 
         self.train_iter = make_iterator(train_ds, True)
@@ -136,6 +135,10 @@ class SequenceBase(pl.LightningModule, abc.ABC):
             length: make_iterator(dataset, False)
             for length, dataset in test_ds_lengths.items()
         }
+
+    @staticmethod
+    def batch_sort_key(example):  # Sort batches to minimize worst-case padding
+        return max(len(example.left), len(example.right))
 
     @abc.abstractmethod
     def forward(self, batch: torchtext.data.Batch) -> torch.Tensor:
@@ -186,16 +189,79 @@ class SequenceBase(pl.LightningModule, abc.ABC):
     def test_step(self, batch, batch_idx):
         logit = self(batch)
         target = batch.target.type_as(logit)
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, target)
-        accuracy = ((logit > 0) == batch.target).float().mean()
+        left_embed, right_embed = self.get_subtree_representations(batch)
 
-        return {"loss": loss.cpu(), "accuracy": accuracy.cpu()}
+        positive = target > 0
+        negative = positive.bitwise_not()
+        predicted_positive = logit > 0
+        predicted_negative = predicted_positive.bitwise_not()
+
+        true_positive = positive.bitwise_and(predicted_positive)
+        true_negative = negative.bitwise_and(predicted_negative)
+        false_positive = negative.bitwise_and(predicted_positive)
+        false_negative = positive.bitwise_and(predicted_negative)
+
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, target)
+        accuracy = (predicted_positive == batch.target).float().mean()
+
+        l2_dists = (left_embed - right_embed).norm(p=2, dim=1)
+        positive_l2_accum = (l2_dists * positive).sum()
+        negative_l2_accum = (l2_dists * negative).sum()
+
+        return {
+            "loss": loss.cpu(),
+            "accuracy": accuracy.cpu(),
+            "true_positive": true_positive.sum().cpu(),
+            "false_positive": false_positive.sum().cpu(),
+            "true_negative": true_negative.sum().cpu(),
+            "false_negative": false_negative.sum().cpu(),
+            "positive_l2_accum": positive_l2_accum.cpu(),
+            "negative_l2_accum": negative_l2_accum.cpu(),
+        }
 
     def test_epoch_end(self, outputs):
-        aggregated = pl.loggers.base.merge_dicts(outputs)
-        test_metrics = {f"test/{k}": torch.tensor(v) for (k, v) in aggregated.items()}
+        agg_key_funcs = {
+            "true_positive": np.sum,
+            "false_positive": np.sum,
+            "true_negative": np.sum,
+            "false_negative": np.sum,
+            "positive_l2_accum": np.sum,
+            "negative_l2_accum": np.sum,
+        }
+        aggregated = pl.loggers.base.merge_dicts(outputs, agg_key_funcs=agg_key_funcs)
 
-        return {"log": test_metrics}
+        positive = aggregated["true_positive"] + aggregated["false_negative"]
+        negative = aggregated["true_negative"] + aggregated["false_positive"]
+
+        precision = aggregated["true_positive"] / (
+            aggregated["true_positive"] + aggregated["false_positive"]
+        )
+        recall = aggregated["true_positive"] / positive
+
+        # Mean L2 distance for all examples which are (or are not) matching
+        mean_positive_l2 = aggregated["positive_l2_accum"] / positive
+        mean_negative_l2 = aggregated["negative_l2_accum"] / negative
+
+        breakpoint()
+
+        test_metrics = {
+            "loss": aggregated["loss"],
+            "accuracy": aggregated["accuracy"],
+            "precision": precision,
+            "recall": recall,
+            "mean_positive_l2": mean_positive_l2,
+            "mean_negative_l2": mean_negative_l2,
+        }
+
+        return {f"test/{k}": torch.tensor(v) for (k, v) in test_metrics.items()}
+
+    @abc.abstractmethod
+    def get_subtree_representations(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Given a batch of examples, get a batch of representations for the left subtree
+        and a batch of representations for the right subtree.
+        """
+        raise NotImplementedError
 
     # Data
     def train_dataloader(self):
@@ -203,36 +269,6 @@ class SequenceBase(pl.LightningModule, abc.ABC):
 
     def val_dataloader(self):
         return self.val_iter
-
-
-def test(model: pl.LightningModule, trainer: pl.Trainer) -> plt.Figure:
-    """
-    Run a model on the test set, plotting the accuracy vs equation depth.
-    """
-    fig, ax = plt.subplots()
-
-    lengths = []
-    accuracies = []
-
-    for length, dataset in model.test_iter_lengths.items():
-        accuracy = trainer.test(model, dataset)["test/accuracy"]
-        lengths.append(length)
-        accuracies.append(accuracy)
-
-    ax.scatter(lengths, accuracies)
-    fig.suptitle("Test accuracies by depth")
-    ax.set_xlabel("Depth")
-    ax.set_ylabel("Accuracy")
-
-    return fig
-
-
-# TODO: make work with non-transformer models
-def test_checkpoint(checkpoint: str):
-    model = SiameseTransformer.load_from_checkpoint(checkpoint)
-    trainer = pl.Trainer(gpus=1)
-    fig = test(model, trainer)
-    fig.show()
 
 
 class SiameseLSTM(SequenceBase):
@@ -327,9 +363,13 @@ class SiameseLSTM(SequenceBase):
 
         return hidden
 
-    def forward(self, batch: torchtext.data.Batch) -> torch.Tensor:
+    def get_subtree_representations(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:
         left_embed = self.dropout(self.embed_sequence(batch.left))
         right_embed = self.dropout(self.embed_sequence(batch.right))
+        return left_embed, right_embed
+
+    def forward(self, batch: torchtext.data.Batch) -> torch.Tensor:
+        left_embed, right_embed = self.get_subtree_representations(batch)
         logit = self.similarity_metric(left_embed, right_embed)
         return logit
 
@@ -444,9 +484,13 @@ class SiameseTransformer(SequenceBase):
         # Sequence representation is the starting <index> token
         return encoded_sequence[0, :, :]
 
-    def forward(self, batch: torchtext.data.Batch) -> torch.Tensor:
+    def get_subtree_representations(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:
         left_embed = self.embed_sequence(batch.left, batch.left_root_index)
         right_embed = self.embed_sequence(batch.right, batch.right_root_index)
+        return (left_embed, right_embed)
+
+    def forward(self, batch: torchtext.data.Batch) -> torch.Tensor:
+        left_embed, right_embed = self.get_subtree_representations(batch)
         logit = self.similarity_metric(left_embed, right_embed)
         return logit
 
@@ -533,6 +577,15 @@ class TreeBase(pl.LightningModule, abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
+    def get_subtree_representations(
+        self, tree: equation_verification.ExpressionTree
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Given an example, get representations for the left subtree and right subtree.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def configure_optimizers(self):
         raise NotImplementedError
 
@@ -566,16 +619,71 @@ class TreeBase(pl.LightningModule, abc.ABC):
         tree, label = example
         logit = self(tree)
         target = torch.tensor(label).type_as(logit)
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, target)
-        accuracy = ((logit > 0) == label).float().mean()
+        left_embed, right_embed = self.get_subtree_representations(tree)
 
-        return {"loss": loss.cpu(), "accuracy": accuracy.cpu()}
+        positive = target > 0
+        negative = positive.bitwise_not()
+        predicted_positive = logit > 0
+        predicted_negative = predicted_positive.bitwise_not()
+
+        true_positive = positive.bitwise_and(predicted_positive)
+        true_negative = negative.bitwise_and(predicted_negative)
+        false_positive = negative.bitwise_and(predicted_positive)
+        false_negative = positive.bitwise_and(predicted_negative)
+
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, target)
+        accuracy = (predicted_positive == label).float().mean()
+
+        l2_dists = (left_embed - right_embed).norm(p=2, dim=0)
+        positive_l2_accum = (l2_dists * positive).sum()
+        negative_l2_accum = (l2_dists * negative).sum()
+
+        return {
+            "loss": loss.cpu(),
+            "accuracy": accuracy.cpu(),
+            "true_positive": true_positive.sum().cpu(),
+            "false_positive": false_positive.sum().cpu(),
+            "true_negative": true_negative.sum().cpu(),
+            "false_negative": false_negative.sum().cpu(),
+            "positive_l2_accum": positive_l2_accum.cpu(),
+            "negative_l2_accum": negative_l2_accum.cpu(),
+        }
 
     def test_epoch_end(self, outputs):
-        aggregated = pl.loggers.base.merge_dicts(outputs)
-        test_metrics = {f"test/{k}": torch.tensor(v) for (k, v) in aggregated.items()}
+        agg_key_funcs = {
+            "true_positive": np.sum,
+            "false_positive": np.sum,
+            "true_negative": np.sum,
+            "false_negative": np.sum,
+            "positive_l2_accum": np.sum,
+            "negative_l2_accum": np.sum,
+        }
+        aggregated = pl.loggers.base.merge_dicts(outputs, agg_key_funcs=agg_key_funcs)
 
-        return {"log": test_metrics}
+        positive = aggregated["true_positive"] + aggregated["false_negative"]
+        negative = aggregated["true_negative"] + aggregated["false_positive"]
+
+        precision = aggregated["true_positive"] / (
+            aggregated["true_positive"] + aggregated["false_positive"]
+        )
+        recall = aggregated["true_positive"] / positive
+
+        # Mean L2 distance for all examples which are (or are not) matching
+        mean_positive_l2 = aggregated["positive_l2_accum"] / positive
+        mean_negative_l2 = aggregated["negative_l2_accum"] / negative
+
+        breakpoint()
+
+        test_metrics = {
+            "loss": aggregated["loss"],
+            "accuracy": aggregated["accuracy"],
+            "precision": precision,
+            "recall": recall,
+            "mean_positive_l2": mean_positive_l2,
+            "mean_negative_l2": mean_negative_l2,
+        }
+
+        return {f"test/{k}": torch.tensor(v) for (k, v) in test_metrics.items()}
 
     # Data
     def train_dataloader(self):
@@ -666,12 +774,139 @@ class TreeRNN(TreeBase):
         return module(combined_rep)
 
     def forward(self, tree: equation_verification.ExpressionTree) -> torch.Tensor:
-        left_embed = self.embed_tree(tree.left)
-        right_embed = self.embed_tree(tree.right)
+        left_embed, right_embed = self.get_subtree_representations(tree)
         logit = self.similarity_metric(
             left_embed.unsqueeze(0), right_embed.unsqueeze(0)
         ).squeeze()
         return logit
 
+    def get_subtree_representations(
+        self, tree: equation_verification.ExpressionTree
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        left_embed = self.embed_tree(tree.left)
+        right_embed = self.embed_tree(tree.right)
+        return (left_embed, right_embed)
+
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+
+
+# TODO: clean up
+def test(
+    model: pl.LightningModule,
+    trainer: pl.Trainer,
+    dataset: str,
+    out_file: str,
+    sequential: bool,
+    train: bool,
+) -> None:
+    """
+    Test a model on a dataset, saving all metrics by depth to a file.
+    """
+    metrics_by_depth = {}
+    depths = (
+        equation_verification.TRAIN_DEPTHS
+        if train
+        else equation_verification.TEST_DEPTHS
+    )
+
+    if sequential:
+        data_by_depth = equation_verification.get_split_sequence_lengths(dataset)
+
+    for depth in depths:
+        print("Testing for depth:", depth)
+
+        if sequential:
+            depth_dataset = torchtext.data.BucketIterator(
+                data_by_depth[depth],
+                model.hparams.batch_size,
+                device=model.device,
+                train=False,
+                shuffle=False,
+                sort_key=SequenceBase.batch_sort_key,
+            )
+        else:
+            depth_dataset = equation_verification.TreesOfDepth(dataset, depth)
+
+        metrics_by_depth[depth] = trainer.test(model, depth_dataset)
+
+    with open(out_file, "w") as f:
+        json.dump(metrics_by_depth, f)
+
+
+# TODO: move to a script
+def test_checkpoint(
+    checkpoint: str, dataset: str, out_file: str, sequential: bool, train: bool
+) -> None:
+    model = SiameseLSTM.load_from_checkpoint(checkpoint)
+    trainer = pl.Trainer(gpus=1)
+    test(model, trainer, dataset, out_file, sequential, train)
+
+
+# TODO: remove
+if __name__ == "__main__":
+    # test_checkpoint(
+    #     "outputs/2020-08-03/12-03-11/checkpoints/epoch=0.ckpt",
+    #     "recursiveMemNet/data/40k_test.json",
+    #     "tree_rnn_test.json",
+    #     sequential=False,
+    #     train=False,
+    # )
+
+    # test_checkpoint(
+    #     "outputs/2020-08-03/14-03-50/checkpoints/epoch=24.ckpt",
+    #     "recursiveMemNet/data/40k_test.json",
+    #     "lstm_test.json",
+    #     sequential=True,
+    #     train=False,
+    # )
+
+    with open("lstm_test.json", "r") as f:
+        lstm_test = json.load(f)
+
+    with open("tree_rnn_test.json", "r") as f:
+        tree_rnn_test = json.load(f)
+
+    lstm_accs = []
+    tree_rnn_accs = []
+
+    lstm_dist_ratios = []
+    tree_dist_ratios = []
+
+    for depth in equation_verification.TEST_DEPTHS:
+        lstm_accs.append(lstm_test[str(depth)]["test/accuracy"])
+        tree_rnn_accs.append(tree_rnn_test[str(depth)]["test/accuracy"])
+
+        lstm_dist_ratios.append(
+            lstm_test[str(depth)]["test/mean_negative_l2"]
+            / lstm_test[str(depth)]["test/mean_positive_l2"]
+        )
+        tree_dist_ratios.append(
+            tree_rnn_test[str(depth)]["test/mean_negative_l2"]
+            / tree_rnn_test[str(depth)]["test/mean_positive_l2"]
+        )
+
+    fig, (ax_1, ax_2) = plt.subplots(ncols=2, figsize=(10, 5))
+
+    ax_1.plot(
+        equation_verification.TEST_DEPTHS, lstm_dist_ratios, label="LSTM", marker="o"
+    )
+    ax_1.plot(
+        equation_verification.TEST_DEPTHS,
+        tree_dist_ratios,
+        label="Tree RNN",
+        marker="o",
+    )
+    ax_1.legend()
+    ax_1.set_xlabel("Depth")
+    ax_1.set_ylabel("L2 distance ratio (negative / positive)")
+
+    ax_2.plot(equation_verification.TEST_DEPTHS, lstm_accs, label="LSTM", marker="o")
+    ax_2.plot(
+        equation_verification.TEST_DEPTHS, tree_rnn_accs, label="Tree RNN", marker="o"
+    )
+    ax_2.legend()
+    ax_2.set_xlabel("Depth")
+    ax_2.set_ylabel("Accuracy")
+
+    fig.show()

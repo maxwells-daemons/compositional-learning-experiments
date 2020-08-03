@@ -20,7 +20,7 @@ import torch
 import torchtext
 
 TRAIN_DEPTHS = [1, 2, 3, 4, 5, 6, 7]
-TEST_DEPTHS = [8, 9, 10, 11, 12, 13, 14, 15]
+TEST_DEPTHS = [8, 9, 10, 11, 12, 13, 14]
 
 
 def to_token(func: str, var: str) -> str:
@@ -370,7 +370,8 @@ class TreeCurriculum(torch.utils.data.IterableDataset):  # type: ignore
         self.binary_vocab: Set[str] = set()
 
         self.data = []
-        for split in raw_data:
+        self.data_by_depth = {}
+        for depth, split in enumerate(raw_data):
             if not split:
                 continue
 
@@ -386,6 +387,25 @@ class TreeCurriculum(torch.utils.data.IterableDataset):  # type: ignore
                 self.unary_vocab = self.unary_vocab.union(tree.unary_vocab())
 
             self.data.extend(deserialized * repeats)
+            self.data_by_depth[depth] = deserialized
+
+    def __iter__(self):
+        return iter(self.data)
+
+
+class TreesOfDepth(torch.utils.data.IterableDataset):  # type: ignore
+    def __init__(self, file: str, depth: int):
+        super(TreesOfDepth, self).__init__()
+
+        with open(file, "r") as f:
+            raw_data = json.load(f)
+
+        self.data = []
+        for serialized in raw_data[depth]:
+            tree = ExpressionTree.from_serialized(serialized["equation"])
+            label = torch.tensor(serialized["label"] == "1")
+            example = (tree, label)
+            self.data.append(example)
 
     def __iter__(self):
         return iter(self.data)

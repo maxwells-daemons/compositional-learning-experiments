@@ -2,6 +2,7 @@
 SCAN/
 recursiveMemNet/
 outputs/
+*.json
 
 ### Vim
 ### From: https://github.com/github/gitignore/blob/master/Global/Vim.gitignore
