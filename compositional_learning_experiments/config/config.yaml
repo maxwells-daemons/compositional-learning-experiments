@@ -1,7 +1,7 @@
 defaults:
-  - task: equation_verification_tree
-  - model: tree_rnn
+  - task: equation_verification_sequential
+  - model: sequential_tree_transformer
 
 trainer:
   gpus: 1
-  max_epochs: 1
+  max_epochs: 45

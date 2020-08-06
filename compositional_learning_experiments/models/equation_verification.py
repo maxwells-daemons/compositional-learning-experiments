@@ -90,26 +90,31 @@ class SequenceBase(pl.LightningModule, abc.ABC):
         task_name: str,
         batch_size: int,
         learning_rate: float,
+        prefix: bool,
         train_dataset: str = "recursiveMemNet/data/40k_train.json",
         val_dataset: str = "recursiveMemNet/data/40k_val_shallow.json",
         test_dataset: str = "recursiveMemNet/data/40k_test.json",
     ):
         super().__init__()
 
-        train_ds = equation_verification.get_split_sequence(train_dataset)
-        val_ds = equation_verification.get_split_sequence(val_dataset)
-        test_ds_lengths = equation_verification.get_split_sequence_lengths(test_dataset)
-
-        all_examples = itertools.chain.from_iterable(
-            [train_ds.examples, val_ds.examples]
-            + [ds.examples for ds in test_ds_lengths.values()]
+        train_ds = equation_verification.get_split_sequence(
+            train_dataset, prefix=prefix
+        )
+        val_ds = equation_verification.get_split_sequence(val_dataset, prefix=prefix)
+        test_ds_lengths = equation_verification.get_split_sequence_lengths(
+            test_dataset, prefix=prefix
         )
 
         def get_length(example):
             return max(len(example.left), len(example.right))
 
         # Include space for <init> and <eos> tokens
+        all_examples = itertools.chain.from_iterable(
+            [train_ds.examples, val_ds.examples]
+            + [ds.examples for ds in test_ds_lengths.values()]
+        )
         self.max_input_length = max(map(get_length, all_examples)) + 2
+        del all_examples
 
         self.text_field = equation_verification.TEXT_FIELD
         self.target_field = equation_verification.TARGET_FIELD
@@ -208,6 +213,13 @@ class SequenceBase(pl.LightningModule, abc.ABC):
         positive_l2_accum = (l2_dists * positive).sum()
         negative_l2_accum = (l2_dists * negative).sum()
 
+        left_magnitudes = left_embed.norm(p=2, dim=1)
+        right_magnitudes = right_embed.norm(p=2, dim=1)
+        dot_products = (left_embed * right_embed).sum(1)
+        cosine_similarities = dot_products / (left_magnitudes * right_magnitudes)
+        positive_cosine_accum = (cosine_similarities * positive).sum()
+        negative_cosine_accum = (cosine_similarities * negative).sum()
+
         return {
             "loss": loss.cpu(),
             "accuracy": accuracy.cpu(),
@@ -217,6 +229,8 @@ class SequenceBase(pl.LightningModule, abc.ABC):
             "false_negative": false_negative.sum().cpu(),
             "positive_l2_accum": positive_l2_accum.cpu(),
             "negative_l2_accum": negative_l2_accum.cpu(),
+            "positive_cosine_accum": positive_cosine_accum.cpu(),
+            "negative_cosine_accum": negative_cosine_accum.cpu(),
         }
 
     def test_epoch_end(self, outputs):
@@ -227,6 +241,8 @@ class SequenceBase(pl.LightningModule, abc.ABC):
             "false_negative": np.sum,
             "positive_l2_accum": np.sum,
             "negative_l2_accum": np.sum,
+            "positive_cosine_accum": np.sum,
+            "negative_cosine_accum": np.sum,
         }
         aggregated = pl.loggers.base.merge_dicts(outputs, agg_key_funcs=agg_key_funcs)
 
@@ -242,7 +258,9 @@ class SequenceBase(pl.LightningModule, abc.ABC):
         mean_positive_l2 = aggregated["positive_l2_accum"] / positive
         mean_negative_l2 = aggregated["negative_l2_accum"] / negative
 
-        breakpoint()
+        # Similar with cosine similarity
+        mean_positive_cosine = aggregated["positive_cosine_accum"] / positive
+        mean_negative_cosine = aggregated["negative_cosine_accum"] / negative
 
         test_metrics = {
             "loss": aggregated["loss"],
@@ -251,6 +269,8 @@ class SequenceBase(pl.LightningModule, abc.ABC):
             "recall": recall,
             "mean_positive_l2": mean_positive_l2,
             "mean_negative_l2": mean_negative_l2,
+            "mean_positive_cosine": mean_positive_cosine,
+            "mean_negative_cosine": mean_negative_cosine,
         }
 
         return {f"test/{k}": torch.tensor(v) for (k, v) in test_metrics.items()}
@@ -314,6 +334,7 @@ class SiameseLSTM(SequenceBase):
             task_name=task_name,
             batch_size=batch_size,
             learning_rate=learning_rate,
+            prefix=False,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             test_dataset=test_dataset,
@@ -421,6 +442,7 @@ class SiameseTransformer(SequenceBase):
             task_name=task_name,
             batch_size=batch_size,
             learning_rate=learning_rate,
+            prefix=False,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             test_dataset=test_dataset,
@@ -518,8 +540,156 @@ class SiameseTransformer(SequenceBase):
         aggregated = pl.loggers.base.merge_dicts(outputs)
         val_metrics = {f"val/{k}": torch.tensor(v) for (k, v) in aggregated.items()}
 
-        for token_set in equation_verification.SEQUENCE_TEST_STRINGS:
+        for tree in equation_verification.TEST_TREES:
+            token_set = (
+                [" <init> "] + equation_verification.tokenize(str(tree)) + [" <eos> "]
+            )
             self.plot_attentions(token_set, self.current_epoch)
+
+        return {"log": val_metrics}
+
+
+class TreePositionalEncoding(torch.nn.Module):
+    def __init__(self, max_depth: int, d_model: int):
+        super(TreePositionalEncoding, self).__init__()
+        assert d_model % ((max_depth + 1) * 2) == 0
+        self.repeats = d_model // ((max_depth + 1) * 2)
+        self.d_model = d_model
+
+    def forward(self, sequence, tree_encoding):
+        # TODO: add learnable parameters
+        scaled = tree_encoding.type_as(sequence) * math.sqrt(self.d_model)
+        repeated = scaled.repeat([1, 1, self.repeats])
+        return sequence + repeated
+
+
+class TreeTransformer(SequenceBase):
+    """
+    TODO
+    """
+
+    def __init__(
+        self,
+        task_name: str,
+        batch_size: int,
+        learning_rate: float,
+        d_model: int,
+        nhead: int,
+        dropout: float,
+        num_layers: int,
+        similarity_metric: str,
+        train_dataset: str = "recursiveMemNet/data/40k_train.json",
+        val_dataset: str = "recursiveMemNet/data/40k_val_shallow.json",
+        test_dataset: str = "recursiveMemNet/data/40k_test.json",
+    ):
+        super().__init__(
+            task_name=task_name,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            prefix=True,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            test_dataset=test_dataset,
+        )
+
+        self.save_hyperparameters()
+        self.hparams.model_name = "TreeTransformer"
+
+        self.similarity_metric = make_similarity_metric(similarity_metric, d_model)
+        self.embedding = torch.nn.Embedding(
+            num_embeddings=len(self.text_field.vocab),
+            embedding_dim=d_model,
+            padding_idx=self.pad_i,
+        )
+        self.dropout = torch.nn.Dropout(p=dropout)
+        self.positional_encoding = TreePositionalEncoding(max_depth=15, d_model=d_model)
+        encoder_layer = torch.nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4, dropout=dropout
+        )
+        encoder_norm = torch.nn.LayerNorm(d_model)
+        self.encoder = torch.nn.TransformerEncoder(
+            encoder_layer, num_layers, encoder_norm
+        )
+
+    def embed_token(
+        self, sequence: torch.Tensor, tree_encoding: torch.Tensor
+    ) -> torch.Tensor:
+        embedded = self.embedding(sequence)
+        scaled = embedded * math.sqrt(self.hparams.d_model)
+        dropped = self.dropout(scaled)
+        return self.positional_encoding(dropped, tree_encoding)
+
+    def embed_sequence(
+        self, sequence: torch.Tensor, positional_encoding: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Transform a variable-length sequence into a fixed-size embedding vector.
+
+        Parameters
+        ----------
+        sequence : torch.Tensor
+            A sequence of token indices, of shape [sequence_length, batch].
+        root_index : torch.Tensor
+            The index in each sequence where the root token is, of shape [batch].
+
+        Returns
+        -------
+        torch.Tensor
+            A fixed-size representation of each sequence, of size [batch, d_model].
+        """
+        pad_mask = (sequence == self.pad_i).T
+        input_embedding = self.embed_token(sequence, positional_encoding)
+        encoded_sequence = self.encoder(input_embedding, src_key_padding_mask=pad_mask)
+
+        # Sequence representation is the root of the expression
+        return encoded_sequence[1, :, :]
+
+    def get_subtree_representations(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:
+        left_embed = self.embed_sequence(batch.left, batch.left_positional_encoding)
+        right_embed = self.embed_sequence(batch.right, batch.right_positional_encoding)
+        return (left_embed, right_embed)
+
+    def forward(self, batch: torchtext.data.Batch) -> torch.Tensor:
+        left_embed, right_embed = self.get_subtree_representations(batch)
+        logit = self.similarity_metric(left_embed, right_embed)
+        return logit
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+        return optimizer
+
+    def plot_attentions(
+        self, tokens: List[str], tree_encoding: torch.Tensor, log_step: int
+    ) -> None:
+        string = "".join(tokens)
+        tokens_tensor = self.text_field.numericalize([tokens], device=self.device)
+        embeddings = self.positional_encoding(
+            self.embedding(tokens_tensor), tree_encoding.unsqueeze(1)
+        )
+
+        for i, layer in enumerate(self.encoder.layers):
+            attentions = layer.self_attn(embeddings, embeddings, embeddings)[1][0]
+            figure = seq2seq.plot_attention(
+                tokens, tokens, attentions.detach().cpu().numpy()
+            )
+
+            name = f"{string}/layer_{i}"
+            self.logger.experiment.add_figure(name, figure, log_step)
+
+            embeddings = layer(embeddings)
+
+    def validation_epoch_end(self, outputs):
+        aggregated = pl.loggers.base.merge_dicts(outputs)
+        val_metrics = {f"val/{k}": torch.tensor(v) for (k, v) in aggregated.items()}
+
+        for tree in equation_verification.TEST_TREES:
+            token_set = (
+                [" <init> "]
+                + equation_verification.tokenize(tree.to_prefix())
+                + [" <eos> "]
+            )
+            positional_encoding = tree.positional_encoding()
+            self.plot_attentions(token_set, positional_encoding, self.current_epoch)
 
         return {"log": val_metrics}
 
@@ -638,6 +808,13 @@ class TreeBase(pl.LightningModule, abc.ABC):
         positive_l2_accum = (l2_dists * positive).sum()
         negative_l2_accum = (l2_dists * negative).sum()
 
+        left_magnitudes = left_embed.norm(p=2)
+        right_magnitudes = right_embed.norm(p=2)
+        dot_products = (left_embed * right_embed).sum()
+        cosine_similarities = dot_products / (left_magnitudes * right_magnitudes)
+        positive_cosine_accum = (cosine_similarities * positive).sum()
+        negative_cosine_accum = (cosine_similarities * negative).sum()
+
         return {
             "loss": loss.cpu(),
             "accuracy": accuracy.cpu(),
@@ -647,6 +824,8 @@ class TreeBase(pl.LightningModule, abc.ABC):
             "false_negative": false_negative.sum().cpu(),
             "positive_l2_accum": positive_l2_accum.cpu(),
             "negative_l2_accum": negative_l2_accum.cpu(),
+            "positive_cosine_accum": positive_cosine_accum.cpu(),
+            "negative_cosine_accum": negative_cosine_accum.cpu(),
         }
 
     def test_epoch_end(self, outputs):
@@ -657,6 +836,8 @@ class TreeBase(pl.LightningModule, abc.ABC):
             "false_negative": np.sum,
             "positive_l2_accum": np.sum,
             "negative_l2_accum": np.sum,
+            "positive_cosine_accum": np.sum,
+            "negative_cosine_accum": np.sum,
         }
         aggregated = pl.loggers.base.merge_dicts(outputs, agg_key_funcs=agg_key_funcs)
 
@@ -672,7 +853,9 @@ class TreeBase(pl.LightningModule, abc.ABC):
         mean_positive_l2 = aggregated["positive_l2_accum"] / positive
         mean_negative_l2 = aggregated["negative_l2_accum"] / negative
 
-        breakpoint()
+        # Similar with cosine similarity
+        mean_positive_cosine = aggregated["positive_cosine_accum"] / positive
+        mean_negative_cosine = aggregated["negative_cosine_accum"] / negative
 
         test_metrics = {
             "loss": aggregated["loss"],
@@ -681,6 +864,8 @@ class TreeBase(pl.LightningModule, abc.ABC):
             "recall": recall,
             "mean_positive_l2": mean_positive_l2,
             "mean_negative_l2": mean_negative_l2,
+            "mean_positive_cosine": mean_positive_cosine,
+            "mean_negative_cosine": mean_negative_cosine,
         }
 
         return {f"test/{k}": torch.tensor(v) for (k, v) in test_metrics.items()}
@@ -838,7 +1023,7 @@ def test(
 def test_checkpoint(
     checkpoint: str, dataset: str, out_file: str, sequential: bool, train: bool
 ) -> None:
-    model = SiameseLSTM.load_from_checkpoint(checkpoint)
+    model = TreeRNN.load_from_checkpoint(checkpoint)
     trainer = pl.Trainer(gpus=1)
     test(model, trainer, dataset, out_file, sequential, train)
 
@@ -846,67 +1031,18 @@ def test_checkpoint(
 # TODO: remove
 if __name__ == "__main__":
     # test_checkpoint(
-    #     "outputs/2020-08-03/12-03-11/checkpoints/epoch=0.ckpt",
+    #     "outputs/lr-tune/5e-4-long/checkpoints/epoch=21.ckpt",
     #     "recursiveMemNet/data/40k_test.json",
-    #     "tree_rnn_test.json",
-    #     sequential=False,
-    #     train=False,
-    # )
-
-    # test_checkpoint(
-    #     "outputs/2020-08-03/14-03-50/checkpoints/epoch=24.ckpt",
-    #     "recursiveMemNet/data/40k_test.json",
-    #     "lstm_test.json",
+    #     "transformer-small-test.json",
     #     sequential=True,
     #     train=False,
     # )
-
-    with open("lstm_test.json", "r") as f:
-        lstm_test = json.load(f)
-
-    with open("tree_rnn_test.json", "r") as f:
-        tree_rnn_test = json.load(f)
-
-    lstm_accs = []
-    tree_rnn_accs = []
-
-    lstm_dist_ratios = []
-    tree_dist_ratios = []
-
-    for depth in equation_verification.TEST_DEPTHS:
-        lstm_accs.append(lstm_test[str(depth)]["test/accuracy"])
-        tree_rnn_accs.append(tree_rnn_test[str(depth)]["test/accuracy"])
-
-        lstm_dist_ratios.append(
-            lstm_test[str(depth)]["test/mean_negative_l2"]
-            / lstm_test[str(depth)]["test/mean_positive_l2"]
-        )
-        tree_dist_ratios.append(
-            tree_rnn_test[str(depth)]["test/mean_negative_l2"]
-            / tree_rnn_test[str(depth)]["test/mean_positive_l2"]
-        )
-
-    fig, (ax_1, ax_2) = plt.subplots(ncols=2, figsize=(10, 5))
-
-    ax_1.plot(
-        equation_verification.TEST_DEPTHS, lstm_dist_ratios, label="LSTM", marker="o"
+    test_checkpoint(
+        "outputs/2020-08-05/tree-depth4-10epoch/checkpoints/epoch=0.ckpt",
+        "recursiveMemNet/data/40k_test.json",
+        "tree-4-10epoch-test.json",
+        sequential=False,
+        train=False,
     )
-    ax_1.plot(
-        equation_verification.TEST_DEPTHS,
-        tree_dist_ratios,
-        label="Tree RNN",
-        marker="o",
-    )
-    ax_1.legend()
-    ax_1.set_xlabel("Depth")
-    ax_1.set_ylabel("L2 distance ratio (negative / positive)")
 
-    ax_2.plot(equation_verification.TEST_DEPTHS, lstm_accs, label="LSTM", marker="o")
-    ax_2.plot(
-        equation_verification.TEST_DEPTHS, tree_rnn_accs, label="Tree RNN", marker="o"
-    )
-    ax_2.legend()
-    ax_2.set_xlabel("Depth")
-    ax_2.set_ylabel("Accuracy")
-
-    fig.show()
+    pass

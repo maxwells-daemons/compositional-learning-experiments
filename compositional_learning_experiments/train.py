@@ -42,6 +42,10 @@ def main(cfg: omegaconf.DictConfig):
         model = equation_verification.SiameseTransformer(
             test_dataset=hydra.utils.to_absolute_path(cfg.task.test_path), **args
         )
+    elif cfg.model_meta.name == "TreeTransformer":
+        model = equation_verification.TreeTransformer(
+            test_dataset=hydra.utils.to_absolute_path(cfg.task.test_path), **args
+        )
     elif cfg.model_meta.name == "TreeRNN":
         model = equation_verification.TreeRNN(epochs=cfg.trainer.max_epochs, **args)
         cfg.trainer.max_epochs = 1  # Epochs handled through curriculum
