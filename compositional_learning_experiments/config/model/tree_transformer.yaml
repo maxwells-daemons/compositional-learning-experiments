@@ -1,17 +1,16 @@
 model_meta:
-  name: TreeTransformer
-  domain: EquationVerificationSequential
+  name: SiameseTreeTransformer
 
 model:
-  d_model: 64
-  num_layers: 4
+  d_model: 32
+  num_layers: 6
   nhead: 4
   dropout: 0.0
   similarity_metric: dot_product
 
 training:
   batch_size: 128
-  learning_rate: 1e-3
+  learning_rate: 1e-4
 
 trainer:
   gradient_clip_val: 1.0

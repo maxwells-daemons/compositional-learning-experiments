@@ -1,8 +1,9 @@
 ### Project files
-SCAN/
 recursiveMemNet/
 outputs/
 *.json
+lightning_logs/
+multirun/
 
 ### Vim
 ### From: https://github.com/github/gitignore/blob/master/Global/Vim.gitignore

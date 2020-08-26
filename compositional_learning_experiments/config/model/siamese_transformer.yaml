@@ -1,18 +1,17 @@
 model_meta:
   name: SiameseTransformer
-  domain: EquationVerificationSequential
 
 model:
   d_model: 64
   num_layers: 4
   nhead: 4
   dropout: 0.0
-  similarity_metric: symmetric_bilinear
-  root_index: true
+  similarity_metric: dot_product
+  root_representation: true
 
 training:
   batch_size: 128
-  learning_rate: 1.0e-3
+  learning_rate: 1e-3
 
 trainer:
   gradient_clip_val: 1.0

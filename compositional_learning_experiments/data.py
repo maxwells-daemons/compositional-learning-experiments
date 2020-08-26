@@ -1,9 +1,11 @@
 """
 Code to work with the equation verification dataset from [Arabshahi et al. 2020].
 
-The dataset can be loaded in two formats:
- - Sequence: mathematical expressions are provided as a textual sequence with
-   parentheses indicating structure (e.g. "(2 * y) + (x * 3)").
+The dataset can be loaded in three formats:
+ - Parentheses: mathematical expressions are provided as a textual sequence in
+   infix order, with parentheses indicating structure (e.g. " ( 2 * y ) + ( x * 3 ) ").
+ - Positional encoding: mathematical expressions are provided as a textual sequence in
+   prefix order with positional encoding indicating structure.
  - Tree: mathematical expressions are provided as a binary tree's pre-order traversal,
    with tensors for vertex labels, parent indices, child indices, and depth.
 
@@ -13,23 +15,12 @@ The task is to predict whether the two expressions are equivalent.
 
 import itertools
 import json
+import random
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import graphviz
 import torch
 import torchtext
-
-TRAIN_DEPTHS = [1, 2, 3, 4, 5, 6, 7]
-TEST_DEPTHS = [8, 9, 10, 11, 12, 13, 14, 15]
-
-
-def to_token(func: str, var: str) -> str:
-    """
-    Convert a vertex in a serialized equation tree into an unambiguous token.
-    """
-    if var:
-        return var
-    return func
 
 
 class ExpressionTree:
@@ -226,7 +217,10 @@ class ExpressionTree:
         if not vars_rev:  # No more symbols to parse
             return None, -1
 
-        root_label = to_token(funcs_rev.pop(), vars_rev.pop())
+        func_symbol = funcs_rev.pop()
+        var_symbol = vars_rev.pop()
+        root_label = var_symbol or func_symbol
+
         if root_label == "#":
             return None, -1
 
@@ -290,10 +284,6 @@ class ExpressionTree:
         )
 
 
-TARGET_FIELD = torchtext.data.Field(
-    sequential=False, use_vocab=False, dtype=torch.int32, is_target=True
-)
-
 # Code to produce sequence datasets
 def tokenize(equation_string: str) -> List[str]:
     """
@@ -303,24 +293,11 @@ def tokenize(equation_string: str) -> List[str]:
     return [" " + token + " " for token in tokens]
 
 
-TEXT_FIELD = torchtext.data.ReversibleField(
-    sequential=True,
-    tokenize=tokenize,
-    pad_token=" <pad> ",
-    unk_token=" <unk> ",
-    init_token=" <init> ",
-    eos_token=" <eos> ",
-)
-INDEX_FIELD = torchtext.data.Field(
-    sequential=False,
-    use_vocab=False,
-    dtype=torch.long,
-    is_target=False,
-    batch_first=True,
-)
-
-
 class StackField(torchtext.data.RawField):
+    """
+    A Field containing examples stacked together in a batch.
+    """
+
     def __init__(self):
         super().__init__()
 
@@ -331,32 +308,48 @@ class StackField(torchtext.data.RawField):
             length = tensor.size(0)
             n_pad = pad_length - length
 
-            # NOTE: we pad with the root encoding, (which seems like a huge problem),
-            # but these positions will be masked by the transformer.
+            # NOTE: we pad with the root encoding, but these positions will be masked
+            # by the transformer.
             return torch.nn.functional.pad(tensor, [0, 0, 0, n_pad], value=0)
 
         return torch.stack([pad(x) for x in batch], 1)
 
 
-POSITIONAL_ENCODING_FIELD = StackField()
+_TEXT_FIELD = torchtext.data.ReversibleField(
+    sequential=True,
+    tokenize=tokenize,
+    pad_token=" <pad> ",
+    unk_token=" <unk> ",
+    init_token=" <init> ",
+    eos_token=" <eos> ",
+)
+_INDEX_FIELD = torchtext.data.Field(
+    sequential=False,
+    use_vocab=False,
+    dtype=torch.long,
+    is_target=False,
+    batch_first=True,
+)
+_TARGET_FIELD = torchtext.data.Field(
+    sequential=False, use_vocab=False, dtype=torch.int32, is_target=True
+)
+_POSITIONAL_ENCODING_FIELD = StackField()
 
-SEQUENCE_FIELDS = {
-    "left": TEXT_FIELD,
-    "right": TEXT_FIELD,
-    "target": TARGET_FIELD,
-    "left_root_index": INDEX_FIELD,
-    "right_root_index": INDEX_FIELD,
+_PARENTHESES_FIELD_MAP = {
+    "left": _TEXT_FIELD,
+    "right": _TEXT_FIELD,
+    "target": _TARGET_FIELD,
+    "left_root_index": _INDEX_FIELD,
+    "right_root_index": _INDEX_FIELD,
 }
-_SEQUENCE_ASSOC_LIST = list(SEQUENCE_FIELDS.items())
 
-TREE_TRANSFORMER_FIELDS = {
-    "left": TEXT_FIELD,
-    "right": TEXT_FIELD,
-    "target": TARGET_FIELD,
-    "left_positional_encoding": POSITIONAL_ENCODING_FIELD,
-    "right_positional_encoding": POSITIONAL_ENCODING_FIELD,
+_POSITIONAL_ENCODING_FIELD_MAP = {
+    "left": _TEXT_FIELD,
+    "right": _TEXT_FIELD,
+    "target": _TARGET_FIELD,
+    "left_positional_encoding": _POSITIONAL_ENCODING_FIELD,
+    "right_positional_encoding": _POSITIONAL_ENCODING_FIELD,
 }
-_TREE_TRANSFORMER_ASSOC_LIST = list(TREE_TRANSFORMER_FIELDS.items())
 
 
 def sequence_root_index(example: ExpressionTree) -> int:
@@ -369,188 +362,146 @@ def sequence_root_index(example: ExpressionTree) -> int:
     return len(tokenize(str(example.left))) + 3  # <init> token and () around left
 
 
-def make_sequence_example(
-    example: Dict[str, Any], prefix: bool = False
-) -> torchtext.data.Example:
+def load_parentheses_dataset(path: str, depths: List[int]) -> torchtext.data.Dataset:
     """
-    Make a Sequence-style example from a serialized equation verification example.
-    If `prefix`, use a parenthesis-free prefix representation with positional encoding.
-    """
-    tree = ExpressionTree.from_serialized(example["equation"])
-    assert tree.left is not None
-    assert tree.right is not None
-    label = int(example["label"] == "1")
+    Load equation verification data as a sequential torchtext Dataset, in infix
+    notation with parentheses.
 
-    if prefix:
+    The Dataset is additionally populated with `leaf_vocab`, `unary_vocab`, and
+    `binary_vocab` sets.
+    """
+    with open(path, "r") as f:
+        data_by_depth = json.load(f)
+
+    leaf_vocab: Set[str] = set()
+    unary_vocab: Set[str] = set()
+    binary_vocab: Set[str] = set()
+
+    def make_example(serialized):
+        tree = ExpressionTree.from_serialized(serialized["equation"])
+        label = int(serialized["label"] == "1")
+        left_root_index = sequence_root_index(tree.left)
+        right_root_index = sequence_root_index(tree.right)
+
+        nonlocal leaf_vocab, unary_vocab, binary_vocab
+        leaf_vocab = leaf_vocab.union(tree.leaf_vocab())
+        unary_vocab = unary_vocab.union(tree.unary_vocab())
+        binary_vocab = binary_vocab.union(tree.binary_vocab())
+
+        return torchtext.data.Example.fromlist(
+            [str(tree.left), str(tree.right), label, left_root_index, right_root_index],
+            list(_PARENTHESES_FIELD_MAP.items()),
+        )
+
+    examples = []
+    for depth in depths:
+        examples.extend(list(map(make_example, data_by_depth[depth])))
+
+    dataset = torchtext.data.Dataset(examples, _PARENTHESES_FIELD_MAP)
+    dataset.leaf_vocab = leaf_vocab
+    dataset.unary_vocab = unary_vocab
+    dataset.binary_vocab = binary_vocab
+    return dataset
+
+
+def load_positional_encoding_dataset(
+    path: str, depths: List[int]
+) -> torchtext.data.Dataset:
+    """
+    Load equation verification data as a sequential torchtext Dataset, in prefix
+    notation with positional encodings.
+
+    The Dataset is additionally populated with `leaf_vocab`, `unary_vocab`, and
+    `binary_vocab` sets.
+    """
+    with open(path, "r") as f:
+        data_by_depth = json.load(f)
+
+    leaf_vocab: Set[str] = set()
+    unary_vocab: Set[str] = set()
+    binary_vocab: Set[str] = set()
+
+    def make_example(serialized):
+        tree = ExpressionTree.from_serialized(serialized["equation"])
+        label = int(serialized["label"] == "1")
         left = tree.left.to_prefix()
         right = tree.right.to_prefix()
         left_positional_encoding = tree.left.positional_encoding()
         right_positional_encoding = tree.right.positional_encoding()
 
+        nonlocal leaf_vocab, unary_vocab, binary_vocab
+        leaf_vocab = leaf_vocab.union(tree.leaf_vocab())
+        unary_vocab = unary_vocab.union(tree.unary_vocab())
+        binary_vocab = binary_vocab.union(tree.binary_vocab())
+
         return torchtext.data.Example.fromlist(
-            [left, right, label, left_positional_encoding, right_positional_encoding],
-            _TREE_TRANSFORMER_ASSOC_LIST,
+            [left, right, label, left_positional_encoding, right_positional_encoding,],
+            list(_POSITIONAL_ENCODING_FIELD_MAP.items()),
         )
 
-    left = str(tree.left)
-    right = str(tree.right)
+    examples = []
+    for depth in depths:
+        examples.extend(list(map(make_example, data_by_depth[depth])))
 
-    left_root_index = sequence_root_index(tree.left)
-    right_root_index = sequence_root_index(tree.right)
-    assert tokenize(tree.left.label)[0] == tokenize(left)[left_root_index - 1]
-    assert tokenize(tree.right.label)[0] == tokenize(right)[right_root_index - 1]
-
-    return torchtext.data.Example.fromlist(
-        [left, right, label, left_root_index, right_root_index], _SEQUENCE_ASSOC_LIST
-    )
+    dataset = torchtext.data.Dataset(examples, _POSITIONAL_ENCODING_FIELD_MAP)
+    dataset.leaf_vocab = leaf_vocab
+    dataset.unary_vocab = unary_vocab
+    dataset.binary_vocab = binary_vocab
+    return dataset
 
 
-def get_split_sequence(file: str, prefix: bool = False) -> torchtext.data.Dataset:
+class TreeDataset(torch.utils.data.Dataset):  # type: ignore
     """
-    Make a Sequence-style dataset from a file of equation verification data.
-    """
-    with open(file, "r") as f:
-        raw_data = json.load(f)
-
-    data_flat = itertools.chain.from_iterable(raw_data)
-    examples = [make_sequence_example(ex, prefix) for ex in data_flat]
-
-    fields = TREE_TRANSFORMER_FIELDS if prefix else SEQUENCE_FIELDS
-    return torchtext.data.Dataset(examples, fields)
-
-
-def get_split_sequence_lengths(
-    file: str, prefix: bool = False
-) -> Dict[int, torchtext.data.Dataset]:
-    """
-    Make a collection of sequence-style datasets, indexed by depth, from a data file.
-    """
-    with open(file, "r") as f:
-        raw_data = json.load(f)
-
-    datasets_and_lengths = {}
-    for length, data in enumerate(raw_data):
-        if not data:
-            continue
-
-        examples = [make_sequence_example(ex, prefix) for ex in data]
-        dataset = torchtext.data.Dataset(examples, SEQUENCE_FIELDS)
-        datasets_and_lengths[length + 1] = dataset
-
-    return datasets_and_lengths
-
-
-# Code to produce tree datasets
-class TreeCurriculum(torch.utils.data.IterableDataset):  # type: ignore
-    """
-    A dataset yielding single tree examples in a fixed curriculum of increasing depth.
-    Note that these examples cannot be batched in their current form.
-
-    Parameters
-    ----------
-    file : str
-        File to load trees from.
-    repeats : int
-        How many times to repeat each stage of the curriculum.
-        Equivalent to epoch count.
+    A Dataset yielding pairs (tree, label), where `tree` is a single ExpressionTree
+    object.
     """
 
-    def __init__(self, file: str, repeats: int = 1):
-        super(TreeCurriculum, self).__init__()
+    def __init__(self, path: str, depths: List[int]):
+        super().__init__()
 
-        with open(file, "r") as f:
-            raw_data = json.load(f)
+        with open(path, "r") as f:
+            data_by_depth = json.load(f)
 
         self.leaf_vocab: Set[str] = set()
         self.unary_vocab: Set[str] = set()
         self.binary_vocab: Set[str] = set()
-
         self.data = []
-        self.data_by_depth = {}
-        for depth, split in enumerate(raw_data):
-            if not split:
-                continue
 
-            deserialized = []
-            for serialized in split:
+        for depth in depths:
+            for serialized in data_by_depth[depth]:
                 tree = ExpressionTree.from_serialized(serialized["equation"])
-                label = torch.tensor(serialized["label"] == "1")
-                example = (tree, label)
-                deserialized.append(example)
+                label = torch.tensor(int(serialized["label"] == "1"))
 
                 self.leaf_vocab = self.leaf_vocab.union(tree.leaf_vocab())
-                self.binary_vocab = self.binary_vocab.union(tree.binary_vocab())
                 self.unary_vocab = self.unary_vocab.union(tree.unary_vocab())
+                self.binary_vocab = self.binary_vocab.union(tree.binary_vocab())
+                self.data.append((tree, label))
 
-            self.data.extend(deserialized * repeats)
-            self.data_by_depth[depth] = deserialized
+        random.shuffle(self.data)
 
-    def __iter__(self):
-        return iter(self.data)
+    def __getitem__(self, i: int) -> Tuple[ExpressionTree, torch.Tensor]:
+        return self.data[i]
 
-
-class TreesOfDepth(torch.utils.data.IterableDataset):  # type: ignore
-    def __init__(self, file: str, depth: int):
-        super(TreesOfDepth, self).__init__()
-
-        with open(file, "r") as f:
-            raw_data = json.load(f)
-
-        self.data = []
-        for serialized in raw_data[depth - 1]:
-            tree = ExpressionTree.from_serialized(serialized["equation"])
-            label = torch.tensor(serialized["label"] == "1")
-            example = (tree, label)
-            self.data.append(example)
-
-    def __iter__(self):
-        return iter(self.data)
+    def __len__(self):
+        return len(self.data)
 
 
-# Expression trees to periodically visualize behavior on
-TEST_TREES = [
-    ExpressionTree(label="2", index=1, left=None, right=None),
-    ExpressionTree(
-        label="Pow",
-        index=1,
-        left=ExpressionTree(label="var_0", index=2, left=None, right=None),
-        right=ExpressionTree(label="1/2", index=3, left=None, right=None),
-    ),
-    ExpressionTree(
-        label="Mul",
-        index=1,
-        left=ExpressionTree(
-            label="Pow",
-            index=2,
-            left=ExpressionTree(label="1", index=3, left=None, right=None),
-            right=ExpressionTree(label="1/2", index=4, left=None, right=None),
-        ),
-        right=ExpressionTree(
-            label="Add",
-            index=5,
-            left=ExpressionTree(label="var_1", index=6, left=None, right=None),
-            right=ExpressionTree(label="var_0", index=7, left=None, right=None),
-        ),
-    ),
-    ExpressionTree(
-        label="Pow",
-        index=4,
-        left=ExpressionTree(
-            label="Add",
-            index=5,
-            left=ExpressionTree(label="0", index=6, left=None, right=None),
-            right=ExpressionTree(
-                label="Pow",
-                index=7,
-                left=ExpressionTree(label="var_0", index=8, left=None, right=None),
-                right=ExpressionTree(label="1", index=9, left=None, right=None),
-            ),
-        ),
-        right=ExpressionTree(
-            label="Add",
-            index=10,
-            left=ExpressionTree(label="0", index=11, left=None, right=None),
-            right=ExpressionTree(label="var_1", index=12, left=None, right=None),
-        ),
-    ),
-]
+def load_dataset(path: str, depths: List[int], data_format: str):
+    """
+    Load a dataset through a uniform interface.
+
+    The type returned depends on data_format, so use the appropriate method instead
+    whenever possible.
+
+    Parameters
+    ----------
+    data_format
+        One of ['parentheses', 'positional_encoding', 'tree']
+    """
+    if data_format == "parentheses":
+        return load_parentheses_dataset(path, depths)
+    if data_format == "positional_encoding":
+        return load_positional_encoding_dataset(path, depths)
+    if data_format == "tree":
+        return TreeDataset(path, depths)
+    raise ValueError(f"Unrecognized data format: {data_format}")

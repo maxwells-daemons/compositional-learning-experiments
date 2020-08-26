@@ -1,0 +1,7 @@
+data:
+  train_path: recursiveMemNet/data/40k_train.json
+  val_path: recursiveMemNet/data/40k_val_shallow.json
+  test_path: recursiveMemNet/data/40k_train.json
+  train_depths: [1, 2]
+  val_depths: [1, 2]
+  test_depths: [3, 4]

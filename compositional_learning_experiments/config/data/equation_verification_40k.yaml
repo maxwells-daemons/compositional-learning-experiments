@@ -1,7 +1,7 @@
-# Equation verification, with tree-structured data
-task:
-  name: EquationVerificationTree
-  domain: EquationVerificationTree
+data:
   train_path: recursiveMemNet/data/40k_train.json
   val_path: recursiveMemNet/data/40k_val_shallow.json
   test_path: recursiveMemNet/data/40k_test.json
+  train_depths: [1, 2, 3, 4, 5, 6, 7]
+  val_depths: [1, 2, 3, 4, 5, 6, 7]
+  test_depths: [8, 9, 10, 11, 12, 13, 14, 15]

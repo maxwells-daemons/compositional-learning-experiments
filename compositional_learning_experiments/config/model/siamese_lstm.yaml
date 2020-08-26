@@ -1,17 +1,17 @@
 model_meta:
-  name: EncoderDecoderRNN
-  domain: Seq2Seq
+  name: SiameseLSTM
 
 model:
   rnn_base: lstm
-  d_model: 256
+  d_model: 64
   num_layers: 2
+  bidirectional: true
   dropout: 0.0
-  bidirectional_encoder: true
+  similarity_metric: dot_product
 
 training:
   batch_size: 128
-  learning_rate: 6.0e-4
+  learning_rate: 1.0e-3
 
 trainer:
   gradient_clip_val: 1.0

@@ -1,7 +1,10 @@
 defaults:
-  - task: equation_verification_sequential
-  - model: sequential_tree_transformer
+  - model: tree_rnn
+  - data: equation_verification_tiny
 
 trainer:
   gpus: 1
-  max_epochs: 45
+  max_epochs: 5
+
+hydra:
+  verbose: __main__

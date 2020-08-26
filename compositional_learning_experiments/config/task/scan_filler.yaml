@@ -1,9 +1,0 @@
-# Train with 0, 1, 2, or 3 variants of the subcommand "<primitive> around right", then
-# test on the subcommand "jump around right" (never seen in training).
-# Valid fillers are: 0, 1, 2, 3
-task:
-  name: SCAN
-  domain: Seq2Seq
-  fillers: 3
-  train_path: SCAN/template_split/tasks_train_filler_num${task.fillers}.txt
-  val_path: SCAN/template_split/tasks_test_filler_num${task.fillers}.txt
