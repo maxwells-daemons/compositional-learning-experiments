@@ -395,7 +395,7 @@ def load_parentheses_dataset(path: str, depths: List[int]) -> torchtext.data.Dat
 
     examples = []
     for depth in depths:
-        examples.extend(list(map(make_example, data_by_depth[depth])))
+        examples.extend(list(map(make_example, data_by_depth[depth - 1])))
 
     dataset = torchtext.data.Dataset(examples, _PARENTHESES_FIELD_MAP)
     dataset.leaf_vocab = leaf_vocab
@@ -441,7 +441,7 @@ def load_positional_encoding_dataset(
 
     examples = []
     for depth in depths:
-        examples.extend(list(map(make_example, data_by_depth[depth])))
+        examples.extend(list(map(make_example, data_by_depth[depth - 1])))
 
     dataset = torchtext.data.Dataset(examples, _POSITIONAL_ENCODING_FIELD_MAP)
     dataset.leaf_vocab = leaf_vocab
