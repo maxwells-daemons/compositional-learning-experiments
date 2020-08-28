@@ -468,7 +468,7 @@ class TreeDataset(torch.utils.data.Dataset):  # type: ignore
         self.data = []
 
         for depth in depths:
-            for serialized in data_by_depth[depth]:
+            for serialized in data_by_depth[depth - 1]:
                 tree = ExpressionTree.from_serialized(serialized["equation"])
                 label = torch.tensor(int(serialized["label"] == "1"))
 
