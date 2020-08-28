@@ -1,0 +1,13 @@
+model_meta:
+  name: VectorQuantizedTreeRNN
+
+model:
+  codebook_size: 128
+  codebook_loss_weight: 1.0
+  commitment_loss_weight: 1.0
+  d_model: 32
+  similarity_metric: dot_product
+
+training:
+  batch_size: 1
+  learning_rate: 1.0e-3
