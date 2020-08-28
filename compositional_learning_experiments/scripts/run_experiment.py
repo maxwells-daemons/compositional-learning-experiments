@@ -42,6 +42,10 @@ def main(cfg: omegaconf.DictConfig):
         model = models.sequence.TreeTransformer(**args)
     elif cfg.model_meta.name == "TreeRNN":
         model = models.tree.TreeRNN(**args)
+    elif cfg.model_meta.name == "VectorQuantizedTreeRNN":
+        model = models.tree.VectorQuantizedTreeRNN(**args)
+    elif cfg.model_meta.name == "RoundingTreeRNN":
+        model = models.tree.RoundingTreeRNN(**args)
     else:
         raise ValueError("Unrecognized model type:", cfg.model_meta.name)
 

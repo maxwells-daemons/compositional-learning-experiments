@@ -1,0 +1,15 @@
+model_meta:
+  name: RoundingTreeRNN
+
+model:
+  precision: 1.0
+  normalize: false
+  l1_penalty: 0.0
+  l2_penalty: 0.0
+  d_model: 16
+  d_inner: 32
+  similarity_metric: dot_product
+
+training:
+  batch_size: 1
+  learning_rate: 1.0e-3

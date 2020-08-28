@@ -84,6 +84,36 @@ class VectorQuantize(torch.nn.Module):
         return VectorQuantizeStraightThrough.apply(self.codebook, embeddings)  # type: ignore
 
 
+class RoundingStraightThrough(torch.autograd.Function):
+    """
+    Rounds tensors to a given precision and backpropagates using the straight-through
+    gradient estimator.
+    """
+
+    @staticmethod
+    def forward(ctx, input, precision):
+        return (input / precision).round() * precision
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = grad_output if ctx.needs_input_grad[0] else None
+        grad_precision = None
+        return grad_input, grad_precision
+
+
+class RoundingLayer(torch.nn.Module):
+    """
+    A wrapper layer for RoundingStraightThrough.
+    """
+
+    def __init__(self, precision: float):
+        super().__init__()
+        self.precision = precision
+
+    def forward(self, inputs: torch.Tensor):
+        return RoundingStraightThrough.apply(inputs, self.precision)  # type: ignore
+
+
 class TreeBase(models.base.EquationVerificationModel):
     """
     An abstract base class for tree-style equation verification models.
@@ -240,14 +270,11 @@ class TreeRNN(TreeBase):
             num_embeddings=len(self.leaf_vocab), embedding_dim=d_model, max_norm=1
         )
         self.unary_modules = torch.nn.ModuleDict(
-            {
-                name: TreeRNN.UnaryModule(d_model, dropout)
-                for name in self.unary_vocab.itos
-            }
+            {name: self.UnaryModule(d_model, dropout) for name in self.unary_vocab.itos}
         )
         self.binary_modules = torch.nn.ModuleDict(
             {
-                name: TreeRNN.BinaryModule(d_model, dropout)
+                name: self.BinaryModule(d_model, dropout)
                 for name in self.binary_vocab.itos
             }
         )
@@ -350,16 +377,10 @@ class VectorQuantizedTreeRNN(TreeBase):
             num_embeddings=len(self.leaf_vocab), embedding_dim=d_model
         )
         self.unary_modules = torch.nn.ModuleDict(
-            {
-                name: VectorQuantizedTreeRNN.UnaryModule(d_model)
-                for name in self.unary_vocab.itos
-            }
+            {name: self.UnaryModule(d_model) for name in self.unary_vocab.itos}
         )
         self.binary_modules = torch.nn.ModuleDict(
-            {
-                name: VectorQuantizedTreeRNN.BinaryModule(d_model)
-                for name in self.binary_vocab.itos
-            }
+            {name: self.BinaryModule(d_model) for name in self.binary_vocab.itos}
         )
 
     def embed_tree_with_losses(
@@ -489,6 +510,222 @@ class VectorQuantizedTreeRNN(TreeBase):
                 "train/loss/codebook": codebook_loss,
                 "train/loss/commitment": commitment_loss,
                 "train/accuracy": accuracy,
+            },
+        }
+
+    def forward(self, tree):
+        logit, left_embed, right_embed, _, _ = self.forward_with_losses(tree)
+        return logit, left_embed, right_embed
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+
+
+class RoundingTreeRNN(TreeBase):
+    """
+    A TreeRNN that rounds activations to a specified precision after each module.
+    """
+
+    class UnaryModule(torch.nn.Module):
+        def __init__(self, d_model: int, d_inner: int, normalize: bool):
+            super().__init__()
+            self.layer_stack = torch.nn.Sequential(
+                torch.nn.Linear(d_model, d_inner),
+                torch.nn.Tanh(),
+                torch.nn.Linear(d_inner, d_model),
+            )
+            self.normalize = normalize
+
+        def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+            output = self.layer_stack(inputs)
+            if self.normalize:
+                output = output / output.norm(p=2)
+            return output
+
+    class BinaryModule(torch.nn.Module):
+        def __init__(self, d_model: int, d_inner: int, normalize: bool):
+            super().__init__()
+            self.layer_stack = torch.nn.Sequential(
+                torch.nn.Linear(2 * d_model, d_inner),
+                torch.nn.Tanh(),
+                torch.nn.Linear(d_inner, d_model),
+            )
+            self.normalize = normalize
+
+        def forward(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+            inputs = torch.cat([left, right], dim=-1)
+            output = self.layer_stack(inputs)
+            if self.normalize:
+                output = output / output.norm(p=2)
+            return output
+
+    def __init__(
+        self,
+        precision: float,
+        normalize: bool,
+        l1_penalty: float,
+        l2_penalty: float,
+        d_model: int,
+        d_inner: int,
+        similarity_metric: str,
+        learning_rate: float,
+        train_path: str,
+        train_depths: List[int],
+        val_path: str,
+        val_depths: List[int],
+        test_path: str,
+        test_depths: List[int],
+        batch_size: int = 1,  # Present for compatibility with the existing interface
+    ):
+        self.save_hyperparameters()
+        self.hparams.model_name = "RoundingTreeRNN"
+        super().__init__(
+            train_path,
+            train_depths,
+            val_path,
+            val_depths,
+            test_path,
+            test_depths,
+            batch_size,
+        )
+
+        self.similarity_metric = models.base.make_similarity_metric(
+            similarity_metric, d_model
+        )
+        self.rounding = RoundingLayer(precision)
+        self.leaf_embedding = torch.nn.Embedding(
+            num_embeddings=len(self.leaf_vocab),
+            embedding_dim=d_model,
+            max_norm=1.0 if normalize else None,
+        )
+        self.unary_modules = torch.nn.ModuleDict(
+            {
+                name: self.UnaryModule(d_model, d_inner, normalize)
+                for name in self.unary_vocab.itos
+            }
+        )
+        self.binary_modules = torch.nn.ModuleDict(
+            {
+                name: self.BinaryModule(d_model, d_inner, normalize)
+                for name in self.binary_vocab.itos
+            }
+        )
+
+    def activation_penalties(
+        self, activation: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.hparams.l1_penalty > 0:
+            l1 = activation.norm(p=1)
+        else:
+            l1 = torch.tensor(0.0, device=self.device)
+
+        if self.hparams.l2_penalty > 0:
+            l2 = activation.norm(p=2)
+        else:
+            l2 = torch.tensor(0.0, device=self.device)
+
+        return l1, l2
+
+    def embed_tree_with_losses(
+        self, tree: data.ExpressionTree
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Recursively computes the representation of a given subtree and the sum of
+        all L1 and L2 activation norms under that subtree.
+
+        Returns
+        -------
+        representation : torch.Tensor
+            The representation of this subtree, extracted at the root.
+            Will be one of the codebook vectors.
+        l1 : torch.Tensor
+            The total accumulated L1 norm of activations under this subtree.
+        l2 : torch.Tensor
+            The total accumulated L2 norm of activations under this subtree.
+        """
+        if tree.left is None and tree.right is None:
+            embed_index = self.leaf_vocab.stoi[tree.label]
+            activation = self.leaf_embedding(
+                torch.tensor(embed_index, device=self.device)
+            )
+            child_l1 = torch.tensor(0, device=self.device)
+            child_l2 = torch.tensor(0, device=self.device)
+        elif tree.left is None:
+            (right_rep, child_l1, child_l2,) = self.embed_tree_with_losses(tree.right)
+            module = self.unary_modules[tree.label]
+            activation = module(right_rep)
+        elif tree.right is None:
+            (left_rep, child_l1, child_l2,) = self.embed_tree_with_losses(tree.left)
+            module = self.unary_modules[tree.label]
+            activation = module(left_rep)
+        else:
+            (left_rep, left_child_l1, left_child_l2,) = self.embed_tree_with_losses(
+                tree.left
+            )
+            (right_rep, right_child_l1, right_child_l2,) = self.embed_tree_with_losses(
+                tree.right
+            )
+
+            module = self.binary_modules[tree.label]
+            activation = module(left_rep, right_rep)
+            child_l1 = left_child_l1 + right_child_l1
+            child_l2 = left_child_l2 + right_child_l2
+
+        root_l1, root_l2 = self.activation_penalties(activation)
+        total_l1 = child_l1 + root_l1
+        total_l2 = child_l2 + root_l2
+        root_quantized = self.rounding(activation)
+
+        return root_quantized, total_l1, total_l2
+
+    def forward_with_losses(
+        self, tree: data.ExpressionTree
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        (left_embed, left_l1, left_l2,) = self.embed_tree_with_losses(tree.left)
+        (right_embed, right_l1, right_l2,) = self.embed_tree_with_losses(tree.right)
+
+        logit = self.similarity_metric(
+            left_embed.unsqueeze(0), right_embed.unsqueeze(0)
+        ).squeeze()
+        total_l1 = left_l1 + right_l1
+        total_l2 = left_l2 + right_l2
+
+        return (
+            logit,
+            left_embed,
+            right_embed,
+            total_l1,
+            total_l2,
+        )
+
+    def training_step(self, example, batch_idx):
+        tree, label = example
+        logit, _, _, total_l1, total_l2 = self.forward_with_losses(tree)
+        target = label.type_as(logit)
+        prediction_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            logit, target
+        )
+        accuracy = ((logit.detach() > 0) == label).float().mean()
+
+        l1_loss = self.hparams.l1_penalty * total_l1
+        l2_loss = self.hparams.l2_penalty * total_l2
+
+        loss = prediction_loss
+        if self.hparams.l1_penalty > 0:
+            loss = loss + l1_loss
+        if self.hparams.l2_penalty > 0:
+            loss = loss + l2_loss
+
+        return {
+            "loss": loss,
+            "log": {
+                "train/loss": loss,
+                "train/loss/prediction": prediction_loss,
+                "train/loss/l1": l1_loss,
+                "train/loss/l2": l2_loss,
+                "train/accuracy": accuracy,
+                "train/total_l1": total_l1,
+                "train/total_l2": total_l2,
             },
         }
 
