@@ -48,6 +48,16 @@ class EquationVerificationModel(pl.LightningModule, abc.ABC):
     def test_step(self, batch, batch_idx):
         raise NotImplementedError
 
+    def on_fit_start(self):
+        # See: https://github.com/PyTorchLightning/pytorch-lightning/issues/1228
+        metrics_placeholder = {
+            "metric/train_acc": 0,
+            "metric/val_acc": 0,
+            "metric/test_acc": 0,
+        }
+
+        self.logger.log_hyperparams(self.hparams, metrics=metrics_placeholder)
+
     def compute_test_metrics(self, prob_equal, target, left_embed, right_embed):
         """
         Compute a set of test metrics, which should be returned from test_step.

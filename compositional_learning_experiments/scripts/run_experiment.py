@@ -27,32 +27,11 @@ def main(cfg: omegaconf.DictConfig):
     logger.info("Beginning experiment")
     logger.info("hparams:\n" + cfg.pretty())
 
-    args = {
-        "batch_size": cfg.training.batch_size,
-        "learning_rate": cfg.training.learning_rate,
-        **cfg.model,
-        **cfg.data,
-    }
-
-    if cfg.model_meta.name == "SiameseLSTM":
-        model = models.sequence.SiameseLSTM(**args)
-    elif cfg.model_meta.name == "SiameseTransformer":
-        model = models.sequence.SiameseTransformer(**args)
-    elif cfg.model_meta.name == "TreeTransformer":
-        model = models.sequence.TreeTransformer(**args)
-    elif cfg.model_meta.name == "TreeRNN":
-        model = models.tree.TreeRNN(**args)
-    elif cfg.model_meta.name == "VectorQuantizedTreeRNN":
-        model = models.tree.VectorQuantizedTreeRNN(**args)
-    elif cfg.model_meta.name == "RoundingTreeRNN":
-        model = models.tree.RoundingTreeRNN(**args)
-    else:
-        raise ValueError("Unrecognized model type:", cfg.model_meta.name)
-
+    model = models.loading.new_model_from_config(cfg)
     trainer = pl.Trainer(
         logger=pl.loggers.TensorBoardLogger(os.getcwd(), name="", version=""),
         checkpoint_callback=pl.callbacks.ModelCheckpoint(save_top_k=-1),
-        **cfg.trainer,
+        **omegaconf.OmegaConf.to_container(cfg.trainer, resolve=True),
     )
 
     logger.info("=== Beginning training ===")
@@ -83,6 +62,18 @@ def main(cfg: omegaconf.DictConfig):
 
     with open("results.json", "w") as f:
         json.dump(results, f, indent=2)
+
+    # Workaround to add metrics to tensorboard
+    train_acc = np.mean(
+        [results["train"][d]["accuracy"] for d in cfg.data.train_depths]
+    )
+    val_acc = np.mean([results["val"][d]["accuracy"] for d in cfg.data.val_depths])
+    test_acc = np.mean([results["test"][d]["accuracy"] for d in cfg.data.test_depths])
+
+    model.logger.experiment.add_scalar("metric/train_acc", train_acc, 1)
+    model.logger.experiment.add_scalar("metric/val_acc", val_acc, 1)
+    model.logger.experiment.add_scalar("metric/test_acc", test_acc, 1)
+    model.logger.experiment.flush()
 
 
 if __name__ == "__main__":

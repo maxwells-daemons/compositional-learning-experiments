@@ -184,7 +184,7 @@ class TreeBase(models.base.EquationVerificationModel):
     def test_step(self, example, batch_idx):
         tree, target = example
         logit, left_embed, right_embed = self(tree)
-        prob_equal = torch.nn.functional.sigmoid(logit)
+        prob_equal = torch.sigmoid(logit)
         return self.compute_test_metrics(prob_equal, target, left_embed, right_embed)
 
     def train_dataloader(self):

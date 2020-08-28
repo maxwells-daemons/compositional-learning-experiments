@@ -196,7 +196,7 @@ class SequenceBase(models.base.EquationVerificationModel):
 
     def test_step(self, batch, batch_idx):
         logit, left_embed, right_embed = self(batch)
-        prob_equal = torch.nn.functional.sigmoid(logit)
+        prob_equal = torch.sigmoid(logit)
         target = batch.target.type_as(logit)
         return self.compute_test_metrics(prob_equal, target, left_embed, right_embed)
 
