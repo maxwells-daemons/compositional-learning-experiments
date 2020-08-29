@@ -39,7 +39,7 @@ def main(ckpt_path):
         for depth in depths:
             ds = data.load_dataset(path, [depth], model.data_format)
             loader = model.make_dataloader(ds, train=False)
-            reps = np.zeros((2 * len(ds), 2 * config.d_model))  # TODO: remove 2 d_model
+            reps = np.zeros((2 * len(ds), config.d_model))
             labels = []
 
             for i, batch in enumerate(loader):
