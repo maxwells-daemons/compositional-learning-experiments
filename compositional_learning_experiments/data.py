@@ -19,6 +19,7 @@ import random
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import graphviz
+import sympy
 import torch
 import torchtext
 
@@ -90,6 +91,26 @@ class ExpressionTree:
             if blank_token:
                 string += " BLANK"
         return string
+
+    def to_sympy(self) -> sympy.Expr:
+        """
+        Convert this tree into a Sympy symbolic expression tree.
+        """
+        if not (self.left or self.right):
+            return sympy.sympify(self.label)
+        if not self.left:
+            right_expr = self.right.to_sympy()  # type: ignore
+            func = sympy.sympify(self.label)
+            return func(right_expr)
+        if not self.right:
+            left_expr = self.left.to_sympy()
+            func = sympy.sympify(self.label)
+            return func(left_expr)
+
+        left_expr = self.left.to_sympy()
+        right_expr = self.right.to_sympy()
+        func = sympy.sympify(self.label)
+        return func(left_expr, right_expr)
 
     def positional_encoding(self, max_depth: int = 15) -> torch.Tensor:
         """

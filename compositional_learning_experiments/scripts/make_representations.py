@@ -14,6 +14,7 @@ import sys
 
 import numpy as np
 import omegaconf
+import sympy
 import torch
 
 from compositional_learning_experiments import models, data
@@ -41,6 +42,7 @@ def main(ckpt_path):
             loader = model.make_dataloader(ds, train=False)
             reps = np.zeros((2 * len(ds), config.d_model))
             labels = []
+            sympy_labels = []
 
             for i, batch in enumerate(loader):
                 if i % 1000 == 0 and i:
@@ -55,6 +57,8 @@ def main(ckpt_path):
 
                     labels.append(str(tree.left))
                     labels.append(str(tree.right))
+                    sympy_labels.append(str(sympy.simplify(tree.left.to_sympy())))
+                    sympy_labels.append(str(sympy.simplify(tree.right.to_sympy())))
                 else:
                     _, left_reps, right_reps = model(batch)
                     start_idx = 2 * batch.batch_size * i
@@ -68,8 +72,13 @@ def main(ckpt_path):
 
                     labels.extend(model.text_field.reverse(batch.left))
                     labels.extend(model.text_field.reverse(batch.right))
+                    # TODO: make sympy labels available in this case
 
-            results[depth] = {"representations": reps, "labels": labels}
+            results[depth] = {
+                "representations": reps,
+                "labels": labels,
+                "sympy_labels": sympy_labels,
+            }
 
         return results
 
